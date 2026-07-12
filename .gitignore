@@ -9,6 +9,8 @@ sessions/session_*.yaml
 !sessions/example_session.yaml
 .DS_Store
 *.log
+*.har
+*.chls
 export/
 web_ui/node_modules/
 web_ui/dist/

@@ -312,9 +312,66 @@ https://mp.weixin.qq.com/mp/profile_ext?action=getmsg&__biz=...&f=json&offset=10
 
 不要选择只有 `action=home` 的页面请求；需要选择 `action=getmsg` 的翻页请求。
 
-### 5.6 从请求中复制三个值
+### 5.6 推荐：导出 HAR 并自动生成会话
 
-选中请求后查看 Request：
+不需要在 Charles 中逐项复制 `uin`、`key` 和 Cookie。让 Charles 保留刚才捕获的请求，然后：
+
+1. 在 Charles 选择 `File` → `Export Session`。
+2. 导出格式选择 `HTTP Archive (.har)`。
+3. 可以导出整个当前 Session，导入器会自动筛选请求。
+4. 将文件保存到本机临时位置，例如 `~/Downloads/wechat-capture.har`。
+5. 回到项目根目录运行：
+
+   ```bash
+   python run.py import-session-har \
+     --file ~/Downloads/wechat-capture.har \
+     --name session_1 \
+     --delete-source
+   ```
+
+命令会自动：
+
+1. 校验 HAR 文件格式和大小。
+2. 只匹配 `mp.weixin.qq.com/mp/profile_ext?action=getmsg`。
+3. 忽略缺少 `uin`、`key` 或 Request Cookie 的无效请求。
+4. 若 HAR 中存在多个候选请求，选择捕获时间最新的一条。
+5. 将参数原子写入 `sessions/session_1.yaml`。
+6. 将会话文件权限设置为仅当前用户可读写（支持该权限模型的系统）。
+7. 终端只显示会话名称、捕获时间和 `biz`，不会显示任何凭据。
+8. 使用 `--delete-source` 时，在成功写入会话后删除敏感 HAR。
+
+刷新已经过期的会话：
+
+```bash
+python run.py import-session-har \
+  --file ~/Downloads/wechat-capture-new.har \
+  --name session_1 \
+  --overwrite \
+  --delete-source
+```
+
+参数说明：
+
+| 参数 | 作用 |
+|---|---|
+| `--file` | Charles 导出的 HAR 文件，必填 |
+| `--name` | 会话文件名称，默认 `session_1` |
+| `--overwrite` | 覆盖已有同名会话，更新过期凭据时使用 |
+| `--delete-source` | 成功导入后删除包含敏感信息的 HAR |
+
+> HAR 不仅包含微信会话，还可能包含导出期间的其他请求信息。请使用全新 Charles Recording，仅捕获必要请求，并优先添加 `--delete-source`。项目已忽略 `*.har` 和 `*.chls`，但仍不要将其放入云盘、邮件或聊天软件。
+
+如果提示未找到请求，检查：
+
+- 导出的是 `.har`，而不是 Charles 专用的 `.chls`。
+- 微信中确实向下翻动了历史列表。
+- Charles 已对 `mp.weixin.qq.com:443` 开启 SSL Proxying。
+- HAR 中存在 `action=getmsg`，而不是只有 `action=home`。
+- 请求中能够看到 `uin`、`key` 和 Request Header `Cookie`。
+
+### 5.7 备用：手工复制三个值
+
+如果当前 Charles 版本无法导出 HAR，可以选中请求并查看 Request：
 
 1. 在 Query String 中复制 `uin` 的值。
 2. 在 Query String 中复制 `key` 的完整值。
@@ -328,7 +385,7 @@ https://mp.weixin.qq.com/mp/profile_ext?action=getmsg&__biz=...&f=json&offset=10
 - 不要复制 Response Headers 中的 `Set-Cookie` 来代替 Request Cookie。
 - 不要把这些内容截图或提交到 Git。
 
-### 5.7 操作完成后恢复手机网络
+### 5.8 操作完成后恢复手机网络
 
 抓包结束后立即：
 
@@ -340,7 +397,9 @@ https://mp.weixin.qq.com/mp/profile_ext?action=getmsg&__biz=...&f=json&offset=10
 
 ## 6. 将会话写入项目
 
-### 6.1 创建会话文件
+完成上一节的 HAR 自动导入后，`sessions/session_1.yaml` 已经生成，不需要再手工编辑。以下手工方式仅作为 HAR 导入不可用时的备用方案。
+
+### 6.1 备用：手工创建会话文件
 
 在项目根目录执行：
 
@@ -568,6 +627,7 @@ jobs:
 | 命令 | 作用 |
 |---|---|
 | `python run.py init-db` | 初始化或迁移数据库 |
+| `python run.py import-session-har --file capture.har --delete-source` | 从 Charles HAR 自动生成会话 |
 | `python run.py import-list` | 导入配置中的 Excel 名单 |
 | `python run.py import-list --file 文件.xlsx` | 导入指定 Excel |
 | `python run.py resolve --limit 3` | 最多解析 3 个账号 |
@@ -614,9 +674,30 @@ python run.py --config config.yaml status
 
 检查会话文件位置、文件名、`enabled`、三个参数和 YAML 格式。`example_session.yaml` 会被程序主动忽略。
 
+若使用 HAR，重新导入并查看命令是否明确显示“微信会话导入成功”：
+
+```bash
+python run.py import-session-har \
+  --file capture.har \
+  --name session_1 \
+  --overwrite
+```
+
+命令不会打印凭据。确认成功后请手动删除 `capture.har`。
+
 ### `invalid session`、`ret=-3` 或 `need_session`
 
-通常表示 `key` 或 Cookie 已过期。重新执行 Charles 抓包步骤，更新原会话文件，然后：
+通常表示 `key` 或 Cookie 已过期。重新捕获并导出 HAR，然后覆盖原会话：
+
+```bash
+python run.py import-session-har \
+  --file capture-new.har \
+  --name session_1 \
+  --overwrite \
+  --delete-source
+```
+
+再执行：
 
 ```bash
 python run.py history --limit 1
@@ -755,6 +836,7 @@ npm audit
 - 遵守微信平台规则、著作权、个人信息保护和所在机构的研究伦理要求。
 - 不要把管理台直接监听到公网；默认 `127.0.0.1` 只允许本机访问。
 - 不要提交 `sessions/session_*.yaml`、数据库或导出文件。
+- HAR 和 Charles Session 可能包含大量敏感请求；导入后立即删除，绝不提交或分享。
 - 不要在日志、论文附录、截图和共享文档中公开 `uin`、`key` 或 Cookie。
 - 遇到验证码、环境异常或明确封禁时停止任务并人工检查。
 - 历史列表保持单 worker，优先保护账号安全和数据质量。

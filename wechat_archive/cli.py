@@ -14,6 +14,10 @@ from wechat_archive.services.fetch_content import fetch_pending_contents
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 from wechat_archive.services.import_accounts import import_name_list
 from wechat_archive.services.resolve_accounts import resolve_pending_accounts
+from wechat_archive.services.session_import import (
+    SessionImportError,
+    import_session_from_har,
+)
 from wechat_archive.services.sessions import load_sessions
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
@@ -74,6 +78,72 @@ def resolve_cmd(ctx: click.Context, limit: int | None) -> None:
     console.print("已将样例文章写入 articles（便于先试正文抓取）。")
 
 
+@cli.command("import-session-har")
+@click.option(
+    "--file",
+    "har_file",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Charles 导出的 HTTP Archive (.har)",
+)
+@click.option(
+    "--name",
+    default="session_1",
+    show_default=True,
+    help="生成的会话名称（不含 .yaml）",
+)
+@click.option("--overwrite", is_flag=True, help="覆盖已有同名会话")
+@click.option(
+    "--delete-source",
+    is_flag=True,
+    help="成功导入后删除含敏感 Cookie 的 HAR",
+)
+@click.pass_context
+def import_session_har_cmd(
+    ctx: click.Context,
+    har_file: Path,
+    name: str,
+    overwrite: bool,
+    delete_source: bool,
+) -> None:
+    """从 Charles HAR 自动提取微信历史会话。"""
+    cfg = ctx.obj["cfg"]
+    try:
+        result = import_session_from_har(
+            har_file,
+            cfg["paths"]["sessions_dir"],
+            name=name,
+            overwrite=overwrite,
+        )
+    except SessionImportError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    table = Table(title="微信会话导入成功")
+    table.add_column("字段")
+    table.add_column("结果")
+    table.add_row("名称", result["name"])
+    table.add_row("文件", result["path"])
+    table.add_row("公众号 biz", result["biz"] or "HAR 中未提供")
+    table.add_row("捕获时间", result["captured_at"] or "HAR 中未提供")
+    table.add_row("候选请求", str(result["candidates_found"]))
+    console.print(table)
+    console.print("[green]已安全写入会话；不会在终端显示 uin、key 或 Cookie。[/green]")
+
+    if delete_source:
+        try:
+            har_file.unlink()
+            console.print(f"[green]已删除敏感 HAR: {har_file}[/green]")
+        except OSError as exc:
+            console.print(
+                f"[yellow]会话已导入，但无法删除 HAR，请手动删除: {exc}[/yellow]"
+            )
+    else:
+        console.print(
+            "[yellow]HAR 含登录凭据。确认导入成功后请将其安全删除，"
+            "切勿上传或提交 Git。[/yellow]"
+        )
+
+
 @cli.command("history")
 @click.option("--limit", default=None, type=int, help="最多处理多少个账号")
 @click.pass_context
@@ -85,8 +155,9 @@ def history_cmd(ctx: click.Context, limit: int | None) -> None:
     if not sessions:
         console.print(
             "[yellow]还没有可用会话。[/yellow]\n"
-            "1. 复制 sessions/example_session.yaml → session_1.yaml\n"
-            "2. 用抓包工具从微信「历史消息」请求中填入 uin / key / cookie\n"
+            "推荐：从 Charles 导出 HAR，然后运行\n"
+            "python run.py import-session-har --file capture.har --delete-source\n"
+            "也可以手工复制 sessions/example_session.yaml 并填入参数。\n"
             "详见 README。"
         )
         return
