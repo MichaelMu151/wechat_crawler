@@ -12,3 +12,4 @@ sessions/session_*.yaml
 export/
 web_ui/node_modules/
 web_ui/dist/
+web_ui/*.tsbuildinfo
