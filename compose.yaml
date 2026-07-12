@@ -1,0 +1,10 @@
+services:
+  archive:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+      - ../name_list.xlsx:/name_list.xlsx:ro
+    restart: unless-stopped

@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterable, Iterator
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS accounts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    nickname_input  TEXT NOT NULL,
+    sample_url      TEXT,
+    biz             TEXT UNIQUE,
+    account_name    TEXT,
+    username        TEXT,
+    head_img        TEXT,
+    resolve_status  TEXT NOT NULL DEFAULT 'pending',
+      -- pending | ok | failed
+    list_status     TEXT NOT NULL DEFAULT 'pending',
+      -- pending | running | done | failed | need_session
+    resolve_error   TEXT,
+    list_error      TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS articles (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    biz             TEXT,
+    sn              TEXT,
+    mid             TEXT,
+    idx             INTEGER,
+    title           TEXT,
+    author          TEXT,
+    digest          TEXT,
+    publish_time    TEXT,
+    publish_ts      INTEGER,
+    url             TEXT,
+    cover_url       TEXT,
+    content_html    TEXT,
+    content_text    TEXT,
+    status          TEXT NOT NULL DEFAULT 'listed',
+      -- listed | ok | deleted | failed | out_of_range
+    content_error   TEXT,
+    raw_list_json   TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    UNIQUE(account_id, sn),
+    UNIQUE(url)
+);
+
+CREATE TABLE IF NOT EXISTS crawl_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage           TEXT NOT NULL,
+    started_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    finished_at     TEXT,
+    ok_count        INTEGER DEFAULT 0,
+    fail_count      INTEGER DEFAULT 0,
+    note            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage           TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    payload_json    TEXT NOT NULL DEFAULT '{}',
+    progress_current INTEGER NOT NULL DEFAULT 0,
+    progress_total  INTEGER,
+    result_json     TEXT,
+    error           TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    started_at      TEXT,
+    heartbeat_at    TEXT,
+    finished_at     TEXT
+);
+
+CREATE TABLE IF NOT EXISTS job_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    event_type      TEXT NOT NULL,
+    message         TEXT,
+    data_json       TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS crawl_checkpoints (
+    account_id      INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    history_offset  INTEGER NOT NULL DEFAULT 0,
+    newest_publish_ts INTEGER,
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_articles_account ON articles(account_id);
+CREATE INDEX IF NOT EXISTS idx_articles_status ON articles(status);
+CREATE INDEX IF NOT EXISTS idx_articles_publish ON articles(publish_ts);
+CREATE INDEX IF NOT EXISTS idx_accounts_biz ON accounts(biz);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id, id);
+"""
+
+ARTICLE_COLUMNS = {
+    "normalized_url": "TEXT",
+    "retry_count": "INTEGER NOT NULL DEFAULT 0",
+    "next_retry_at": "TEXT",
+    "last_fetched_at": "TEXT",
+}
+
+ACCOUNT_COLUMNS = {
+    "last_listed_at": "TEXT",
+}
+
+
+class Database:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(SCHEMA)
+            self._ensure_columns(conn, "articles", ARTICLE_COLUMNS)
+            self._ensure_columns(conn, "accounts", ACCOUNT_COLUMNS)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_articles_retry "
+                "ON articles(status, next_retry_at)"
+            )
+            self._init_fts(conn)
+
+    @staticmethod
+    def _ensure_columns(
+        conn: sqlite3.Connection, table: str, columns: dict[str, str]
+    ) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    @staticmethod
+    def _init_fts(conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS articles_fts USING fts5(
+                    title, author, digest, content_text,
+                    content='articles', content_rowid='id',
+                    tokenize='unicode61'
+                )
+                """
+            )
+            conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS articles_fts_ai AFTER INSERT ON articles BEGIN
+                    INSERT INTO articles_fts(rowid, title, author, digest, content_text)
+                    VALUES (new.id, new.title, new.author, new.digest, new.content_text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS articles_fts_ad AFTER DELETE ON articles BEGIN
+                    INSERT INTO articles_fts(articles_fts, rowid, title, author, digest, content_text)
+                    VALUES ('delete', old.id, old.title, old.author, old.digest, old.content_text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS articles_fts_au AFTER UPDATE ON articles BEGIN
+                    INSERT INTO articles_fts(articles_fts, rowid, title, author, digest, content_text)
+                    VALUES ('delete', old.id, old.title, old.author, old.digest, old.content_text);
+                    INSERT INTO articles_fts(rowid, title, author, digest, content_text)
+                    VALUES (new.id, new.title, new.author, new.digest, new.content_text);
+                END;
+                """
+            )
+            count = conn.execute("SELECT COUNT(*) FROM articles_fts").fetchone()[0]
+            if count == 0:
+                conn.execute("INSERT INTO articles_fts(articles_fts) VALUES ('rebuild')")
+        except sqlite3.OperationalError:
+            # Some minimal SQLite builds do not include FTS5; API falls back to LIKE.
+            pass
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
+        with self.connection() as conn:
+            return conn.execute(sql, params)
+
+    def executemany(self, sql: str, seq) -> None:
+        with self.connection() as conn:
+            conn.executemany(sql, seq)
+
+    def iter_rows(
+        self, sql: str, params: tuple | dict = (), batch_size: int = 500
+    ) -> Iterable[sqlite3.Row]:
+        with self.connection() as conn:
+            cursor = conn.execute(sql, params)
+            while rows := cursor.fetchmany(batch_size):
+                yield from rows
+
+    def fetchall(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return list(conn.execute(sql, params).fetchall())
+
+    def fetchone(self, sql: str, params: tuple | dict = ()) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(sql, params).fetchone()
+
+    def recover_stale_work(self, stale_minutes: int = 30) -> dict[str, int]:
+        """Make interrupted account and job work eligible for another attempt."""
+        with self.connection() as conn:
+            accounts = conn.execute(
+                """
+                UPDATE accounts
+                SET list_status='failed', list_error='interrupted; safe to retry',
+                    updated_at=datetime('now','localtime')
+                WHERE list_status='running'
+                """
+            ).rowcount
+            jobs = conn.execute(
+                """
+                UPDATE jobs
+                SET status='failed', error='worker heartbeat expired',
+                    finished_at=datetime('now','localtime')
+                WHERE status='running'
+                  AND COALESCE(heartbeat_at, started_at) <
+                      datetime('now', ?, 'localtime')
+                """,
+                (f"-{stale_minutes} minutes",),
+            ).rowcount
+        return {"accounts": accounts, "jobs": jobs}

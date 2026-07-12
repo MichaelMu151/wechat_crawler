@@ -1,0 +1,40 @@
+# 试点配置：可按需修改
+
+paths:
+  # 默认读取上级目录的名单；也可改成项目内路径
+  name_list: ../name_list.xlsx
+  database: data/wechat_archive.db
+  sessions_dir: sessions
+
+crawl:
+  # 历史时间窗（含边界）
+  start_date: "2018-01-01"
+  # 系统当前为 2026；样例文也可能是当年发文
+  end_date: "2026-12-31"
+  # 请求间隔（秒），慢速优先
+  sleep_min: 4
+  sleep_max: 9
+  # 历史列表每页条数（微信接口通常为 10）
+  history_page_size: 10
+  # 正文失败最多重试次数
+  content_max_retries: 3
+  # User-Agent：模拟微信内置浏览器
+  user_agent: >-
+    Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)
+    AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148
+    MicroMessenger/8.0.40(0x18002831) NetType/WIFI Language/zh_CN
+
+http:
+  timeout: 30
+  max_retries: 3
+  backoff_factor: 1.0
+  pool_connections: 4
+  pool_maxsize: 8
+  # 禁用系统代理，避免本机抓包软件干扰
+  trust_env: false
+  # 可选：http://user:pass@host:port 或 socks5://host:port
+  proxy:
+
+jobs:
+  # 历史列表接口对并发敏感，默认只运行一个持久任务
+  workers: 1
