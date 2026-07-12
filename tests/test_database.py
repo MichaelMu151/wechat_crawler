@@ -22,6 +22,29 @@ def test_schema_migrates_and_recovers_running_accounts(tmp_path: Path) -> None:
     assert "safe to retry" in account["list_error"]
 
 
+def test_recover_stale_work_keeps_recent_running_jobs(tmp_path: Path) -> None:
+    db = Database(tmp_path / "archive.db")
+    with db.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (stage, status, started_at, heartbeat_at)
+            VALUES (
+                'content',
+                'running',
+                datetime('now','localtime'),
+                datetime('now','localtime')
+            )
+            """
+        )
+
+    recovered = db.recover_stale_work(stale_minutes=30)
+
+    job = db.fetchone("SELECT status FROM jobs")
+    assert recovered["jobs"] == 0
+    assert job is not None
+    assert job["status"] == "running"
+
+
 def test_iter_rows_streams_batches(tmp_path: Path) -> None:
     db = Database(tmp_path / "archive.db")
     db.executemany(

@@ -27,7 +27,8 @@ runner = JobRunner(db, cfg, workers=int(cfg.get("jobs", {}).get("workers", 1)))
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    db.recover_stale_work(stale_minutes=0)
+    stale_minutes = int(cfg.get("jobs", {}).get("stale_minutes", 30))
+    db.recover_stale_work(stale_minutes=stale_minutes)
     runner.resume_pending()
     yield
     runner.executor.shutdown(wait=False, cancel_futures=False)

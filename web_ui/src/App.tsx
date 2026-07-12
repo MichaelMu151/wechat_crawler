@@ -22,6 +22,27 @@ type Job = {
   error?: string;
 };
 
+const PAGE_SIZE = 50;
+const STATUS_OPTIONS = ["", "ok", "listed", "retry_wait", "failed", "deleted", "out_of_range"];
+const STATUS_LABELS: Record<string, string> = {
+  ok: "已归档",
+  listed: "待抓取",
+  retry_wait: "等待重试",
+  failed: "失败",
+  deleted: "已删除",
+  out_of_range: "超出范围",
+  pending: "等待中",
+  running: "运行中",
+  done: "完成",
+  cancelled: "已取消",
+};
+const STAGE_LABELS: Record<string, string> = {
+  import: "导入名单",
+  resolve: "解析账号",
+  history: "增量历史",
+  content: "抓取正文",
+};
+
 const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -34,28 +55,52 @@ const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
 export default function App() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [articles, setArticles] = useState<Article[]>([]);
+  const [articleTotal, setArticleTotal] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [offset, setOffset] = useState(0);
   const [publicUrl, setPublicUrl] = useState("");
   const [preview, setPreview] = useState<number | null>(null);
   const [error, setError] = useState("");
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const search = query ? `?q=${encodeURIComponent(query)}` : "";
+      const params = new URLSearchParams({
+        limit: String(PAGE_SIZE),
+        offset: String(offset),
+      });
+      if (debouncedQuery) params.set("q", debouncedQuery);
+      if (statusFilter) params.set("status", statusFilter);
       const [nextStats, articlePage, nextJobs] = await Promise.all([
         api<Stats>("/api/v1/stats"),
-        api<{ items: Article[] }>(`/api/v1/articles${search}`),
+        api<{ items: Article[]; total: number }>(`/api/v1/articles?${params}`),
         api<Job[]>("/api/v1/jobs"),
       ]);
       setStats(nextStats);
       setArticles(articlePage.items);
+      setArticleTotal(articlePage.total);
       setJobs(nextJobs);
       setError("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "加载失败");
     }
+  }, [debouncedQuery, offset, statusFilter]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedQuery(query.trim());
+      setOffset(0);
+    }, 400);
+    return () => window.clearTimeout(timer);
   }, [query]);
+
+  useEffect(() => {
+    setOffset(0);
+  }, [statusFilter]);
 
   useEffect(() => {
     void refresh();
@@ -64,22 +109,52 @@ export default function App() {
   }, [refresh]);
 
   const run = async (stage: string) => {
-    await api("/api/v1/jobs", {
-      method: "POST",
-      body: JSON.stringify({ stage }),
-    });
-    await refresh();
+    setPendingAction(stage);
+    setError("");
+    try {
+      await api("/api/v1/jobs", {
+        method: "POST",
+        body: JSON.stringify({ stage }),
+      });
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "任务提交失败");
+    } finally {
+      setPendingAction(null);
+    }
   };
 
   const addUrl = async (event: FormEvent) => {
     event.preventDefault();
-    await api("/api/v1/articles/public", {
-      method: "POST",
-      body: JSON.stringify({ url: publicUrl }),
-    });
-    setPublicUrl("");
-    await run("content");
+    setPendingAction("public");
+    setError("");
+    try {
+      await api("/api/v1/articles/public", {
+        method: "POST",
+        body: JSON.stringify({ url: publicUrl }),
+      });
+      await api("/api/v1/jobs", {
+        method: "POST",
+        body: JSON.stringify({ stage: "content" }),
+      });
+      setPublicUrl("");
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "归档链接失败");
+    } finally {
+      setPendingAction(null);
+    }
   };
+
+  const manualRefresh = async () => {
+    setRefreshing(true);
+    await refresh();
+    setRefreshing(false);
+  };
+
+  const page = Math.floor(offset / PAGE_SIZE) + 1;
+  const totalPages = Math.max(1, Math.ceil(articleTotal / PAGE_SIZE));
+  const hasRunningAction = pendingAction !== null;
 
   return (
     <main>
@@ -89,7 +164,9 @@ export default function App() {
           <h1>微信文章归档</h1>
           <p className="subtle">可恢复采集、质量状态与本地全文浏览</p>
         </div>
-        <button onClick={() => void refresh()}>刷新</button>
+        <button disabled={refreshing} onClick={() => void manualRefresh()}>
+          {refreshing ? "刷新中…" : "刷新"}
+        </button>
       </header>
 
       {error && <aside className="error">{error}</aside>}
@@ -107,10 +184,16 @@ export default function App() {
           <p className="subtle">历史列表保持低并发，正文失败会自动退避重试。</p>
         </div>
         <div className="buttonRow">
-          <button onClick={() => void run("import")}>导入名单</button>
-          <button onClick={() => void run("resolve")}>解析账号</button>
-          <button onClick={() => void run("history")}>增量历史</button>
-          <button className="primary" onClick={() => void run("content")}>抓取正文</button>
+          {["import", "resolve", "history", "content"].map((stage) => (
+            <button
+              className={stage === "content" ? "primary" : undefined}
+              disabled={hasRunningAction}
+              key={stage}
+              onClick={() => void run(stage)}
+            >
+              {pendingAction === stage ? "提交中…" : STAGE_LABELS[stage]}
+            </button>
+          ))}
         </div>
         <form onSubmit={(event) => void addUrl(event)}>
           <input
@@ -120,7 +203,9 @@ export default function App() {
             value={publicUrl}
             onChange={(event) => setPublicUrl(event.target.value)}
           />
-          <button type="submit">归档链接</button>
+          <button disabled={hasRunningAction} type="submit">
+            {pendingAction === "public" ? "归档中…" : "归档链接"}
+          </button>
         </form>
       </section>
 
@@ -128,24 +213,52 @@ export default function App() {
         <section className="panel">
           <div className="sectionHead">
             <h2>文章库</h2>
-            <input
-              aria-label="搜索文章"
-              placeholder="标题、作者或正文"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
+            <div className="filters">
+              <select
+                aria-label="按状态筛选"
+                value={statusFilter}
+                onChange={(event) => setStatusFilter(event.target.value)}
+              >
+                {STATUS_OPTIONS.map((status) => (
+                  <option key={status || "all"} value={status}>
+                    {status ? STATUS_LABELS[status] || status : "全部状态"}
+                  </option>
+                ))}
+              </select>
+              <input
+                aria-label="搜索文章"
+                placeholder="标题、作者或正文"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
+            </div>
           </div>
+          <p className="subtle listSummary">共 {articleTotal.toLocaleString()} 篇，当前第 {page} / {totalPages} 页</p>
           <div className="list">
             {articles.map((article) => (
               <button className="row" key={article.id} onClick={() => setPreview(article.id)}>
                 <span>
                   <strong>{article.title || "等待抓取标题"}</strong>
                   <small>{article.account_name || "未知公众号"} · {article.publish_time || "时间未知"}</small>
+                  {article.content_error && (
+                    <small className="inlineError">失败原因：{article.content_error}</small>
+                  )}
                 </span>
                 <Status value={article.status} />
               </button>
             ))}
             {!articles.length && <p className="empty">暂无匹配文章</p>}
+          </div>
+          <div className="pager">
+            <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>
+              上一页
+            </button>
+            <button
+              disabled={offset + PAGE_SIZE >= articleTotal}
+              onClick={() => setOffset(offset + PAGE_SIZE)}
+            >
+              下一页
+            </button>
           </div>
         </section>
 
@@ -155,7 +268,7 @@ export default function App() {
             {jobs.slice(0, 12).map((job) => (
               <div className="row" key={job.id}>
                 <span>
-                  <strong>#{job.id} {job.stage}</strong>
+                  <strong>#{job.id} {STAGE_LABELS[job.stage] || job.stage}</strong>
                   <small>{job.created_at}{job.error ? ` · ${job.error}` : ""}</small>
                 </span>
                 <Status value={job.status} />
@@ -187,7 +300,7 @@ function Metric({ label, value }: { label: string; value: number }) {
 }
 
 function Status({ value }: { value: string }) {
-  return <span className={`status status-${value}`}>{value}</span>;
+  return <span className={`status status-${value}`}>{STATUS_LABELS[value] || value}</span>;
 }
 
 function sum(values?: Record<string, number>) {

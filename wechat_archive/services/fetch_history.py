@@ -3,13 +3,14 @@ from __future__ import annotations
 import random
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from wechat_archive.db import Database
 from wechat_archive.http_client import HttpClient
 from wechat_archive.parsers.article_html import normalize_content_url
 from wechat_archive.parsers.history_json import parse_history_payload
+from wechat_archive.services.job_control import JobCancelled
 from wechat_archive.services.sessions import load_sessions
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
@@ -35,6 +36,7 @@ def fetch_history_for_accounts(
     client: HttpClient,
     cfg: dict[str, Any],
     limit_accounts: int | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """对已解析 biz 的账号拉取历史列表（需会话）。"""
     sessions = load_sessions(cfg["paths"]["sessions_dir"])
@@ -65,6 +67,8 @@ def fetch_history_for_accounts(
     account_ok = account_fail = articles_added = 0
 
     for acc in accounts:
+        if checkpoint:
+            checkpoint()
         account_id = acc["id"]
         biz = acc["biz"]
         with db.connection() as conn:
@@ -93,13 +97,14 @@ def fetch_history_for_accounts(
         reached_old = False
         try:
             while True:
-                session = pool.next()
-                payload = _request_history(
+                if checkpoint:
+                    checkpoint()
+                payload = _request_history_with_failover(
                     client=client,
                     biz=biz,
                     offset=offset,
                     count=page_size,
-                    session=session,
+                    pool=pool,
                 )
                 rows, can_continue = parse_history_payload(payload)
 
@@ -207,6 +212,8 @@ def fetch_history_for_accounts(
                     (account_id,),
                 )
             account_ok += 1
+        except JobCancelled:
+            raise
         except Exception as e:
             msg = str(e)
             status = "need_session" if _is_session_error(msg) else "failed"
@@ -236,6 +243,32 @@ def fetch_history_for_accounts(
 def _is_session_error(msg: str) -> bool:
     keys = ("invalid session", "失效", "过期", "频繁", "验证", "ret=")
     return any(k in msg.lower() or k in msg for k in keys)
+
+
+def _request_history_with_failover(
+    client: HttpClient,
+    biz: str,
+    offset: int,
+    count: int,
+    pool: SessionPool,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    for _ in range(len(pool.sessions)):
+        session = pool.next()
+        try:
+            return _request_history(
+                client=client,
+                biz=biz,
+                offset=offset,
+                count=count,
+                session=session,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if not _is_session_error(msg):
+                raise
+            errors.append(f"{session.get('name', 'session')}: {msg[:200]}")
+    raise RuntimeError("all sessions failed for history page: " + " | ".join(errors))
 
 
 def _request_history(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Any
+from typing import Any, Callable
 
 from wechat_archive.db import Database
 from wechat_archive.http_client import HttpClient
@@ -14,6 +14,7 @@ def resolve_pending_accounts(
     client: HttpClient,
     cfg: dict[str, Any],
     limit: int | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """用样例文章链接解析 __biz 与公众号名。"""
     sleep_min = cfg["crawl"]["sleep_min"]
@@ -31,6 +32,8 @@ def resolve_pending_accounts(
 
     ok = fail = 0
     for i, row in enumerate(rows):
+        if checkpoint:
+            checkpoint()
         account_id = row["id"]
         url = row["sample_url"]
         try:
@@ -97,6 +100,8 @@ def resolve_pending_accounts(
             fail += 1
 
         if i < len(rows) - 1:
+            if checkpoint:
+                checkpoint()
             time.sleep(random.uniform(sleep_min, sleep_max))
 
     return {"ok": ok, "fail": fail, "total": len(rows)}

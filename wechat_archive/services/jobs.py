@@ -10,6 +10,7 @@ from wechat_archive.http_client import HttpClient
 from wechat_archive.services.fetch_content import fetch_pending_contents
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 from wechat_archive.services.import_accounts import import_name_list
+from wechat_archive.services.job_control import JobCancelled, JobControl
 from wechat_archive.services.resolve_accounts import resolve_pending_accounts
 
 
@@ -96,12 +97,14 @@ class JobRunner:
             )
             self.event(job_id, "started", f"开始 {row['stage']} 任务")
             payload = json.loads(row["payload_json"] or "{}")
-            result = self._dispatch(row["stage"], payload)
+            result = self._dispatch(job_id, row["stage"], payload)
             latest = self.db.fetchone(
                 "SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)
             )
             status = "cancelled" if latest and latest["cancel_requested"] else "done"
             self._finish(job_id, status, result)
+        except JobCancelled as exc:
+            self._finish(job_id, "cancelled", {"message": str(exc)})
         except Exception as exc:
             self.db.execute(
                 """
@@ -116,8 +119,11 @@ class JobRunner:
             with self._lock:
                 self._submitted.discard(job_id)
 
-    def _dispatch(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch(
+        self, job_id: int, stage: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         client = HttpClient(self.cfg)
+        control = JobControl(self.db, job_id)
         try:
             if stage == "import":
                 return import_name_list(
@@ -125,7 +131,11 @@ class JobRunner:
                 )
             if stage == "resolve":
                 return resolve_pending_accounts(
-                    self.db, client, self.cfg, limit=payload.get("limit")
+                    self.db,
+                    client,
+                    self.cfg,
+                    limit=payload.get("limit"),
+                    checkpoint=control.checkpoint,
                 )
             if stage == "history":
                 return fetch_history_for_accounts(
@@ -133,10 +143,15 @@ class JobRunner:
                     client,
                     self.cfg,
                     limit_accounts=payload.get("limit"),
+                    checkpoint=control.checkpoint,
                 )
             if stage == "content":
                 return fetch_pending_contents(
-                    self.db, client, self.cfg, limit=payload.get("limit")
+                    self.db,
+                    client,
+                    self.cfg,
+                    limit=payload.get("limit"),
+                    checkpoint=control.checkpoint,
                 )
             raise ValueError(f"unsupported job stage: {stage}")
         finally:

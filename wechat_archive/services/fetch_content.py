@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from wechat_archive.db import Database
 from wechat_archive.http_client import HttpClient
@@ -16,6 +16,7 @@ def fetch_pending_contents(
     client: HttpClient,
     cfg: dict[str, Any],
     limit: int | None = None,
+    checkpoint: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """Fetch listed/retryable content with bounded, observable retries."""
     sleep_min = cfg["crawl"]["sleep_min"]
@@ -44,6 +45,8 @@ def fetch_pending_contents(
 
     ok = deleted = failed = skipped = 0
     for i, row in enumerate(rows):
+        if checkpoint:
+            checkpoint()
         article_id = row["id"]
         url = row["url"]
         publish_ts = row["publish_ts"]
@@ -174,6 +177,8 @@ def fetch_pending_contents(
             failed += 1
 
         if i < len(rows) - 1:
+            if checkpoint:
+                checkpoint()
             time.sleep(random.uniform(sleep_min, sleep_max))
 
     return {
