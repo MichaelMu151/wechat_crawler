@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -26,9 +27,7 @@ console = Console()
 
 def _db(cfg) -> Database:
     ensure_dirs(cfg)
-    db = Database(cfg["paths"]["database"])
-    db.recover_stale_work()
-    return db
+    return Database(cfg["paths"]["database"], cfg.get("database"))
 
 
 @click.group()
@@ -283,6 +282,37 @@ def export_jsonl(ctx: click.Context, out: str, status_filter: str) -> None:
             f.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
             count += 1
     console.print(f"[green]已导出 {count} 条 → {out_path}[/green]")
+
+
+@cli.command("backup-db")
+@click.option("--out", default=None, help="备份文件路径；默认写入 data/backups")
+@click.pass_context
+def backup_db_cmd(ctx: click.Context, out: str | None) -> None:
+    """使用 SQLite online backup API 创建一致性备份。"""
+    cfg = ctx.obj["cfg"]
+    db = Database(cfg["paths"]["database"], cfg.get("database"))
+    if out:
+        destination = Path(out)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        destination = Path(cfg["paths"]["database"]).parent / "backups" / (
+            f"wechat_archive-{stamp}.db"
+        )
+    if not destination.is_absolute():
+        destination = Path(__file__).resolve().parents[1] / destination
+    result = db.backup(destination)
+    console.print(f"[green]一致性备份完成:[/green] {result}")
+
+
+@cli.command("maintain-db")
+@click.option("--event-retention-days", default=30, type=click.IntRange(min=1))
+@click.pass_context
+def maintain_db_cmd(ctx: click.Context, event_retention_days: int) -> None:
+    """检查数据库、更新查询统计、清理事件并截断 WAL。"""
+    cfg = ctx.obj["cfg"]
+    db = Database(cfg["paths"]["database"], cfg.get("database"))
+    result = db.maintain(event_retention_days)
+    console.print(f"数据库维护完成: {result}")
 
 
 @cli.command("pilot")

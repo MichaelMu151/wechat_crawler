@@ -28,12 +28,23 @@ class JobRunner:
 
     def create(self, stage: str, payload: dict[str, Any] | None = None) -> int:
         payload = payload or {}
-        with self.db.connection() as conn:
-            cursor = conn.execute(
-                "INSERT INTO jobs (stage, payload_json) VALUES (?, ?)",
-                (stage, json.dumps(payload, ensure_ascii=False)),
-            )
-            job_id = int(cursor.lastrowid)
+        with self._lock:
+            with self.db.connection() as conn:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE stage=? AND status IN ('pending','running')
+                    ORDER BY id LIMIT 1
+                    """,
+                    (stage,),
+                ).fetchone()
+                if existing:
+                    return int(existing["id"])
+                cursor = conn.execute(
+                    "INSERT INTO jobs (stage, payload_json) VALUES (?, ?)",
+                    (stage, json.dumps(payload, ensure_ascii=False)),
+                )
+                job_id = int(cursor.lastrowid)
         self.submit(job_id)
         return job_id
 
@@ -90,7 +101,8 @@ class JobRunner:
                 """
                 UPDATE jobs SET status='running',
                     started_at=datetime('now','localtime'),
-                    heartbeat_at=datetime('now','localtime')
+                    heartbeat_at=datetime('now','localtime'),
+                    progress_current=0, progress_total=NULL, error=NULL
                 WHERE id=?
                 """,
                 (job_id,),
@@ -123,7 +135,13 @@ class JobRunner:
         self, job_id: int, stage: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
         client = HttpClient(self.cfg)
-        control = JobControl(self.db, job_id)
+        jobs_cfg = self.cfg.get("jobs", {})
+        control = JobControl(
+            self.db,
+            job_id,
+            heartbeat_interval=float(jobs_cfg.get("heartbeat_interval", 10)),
+            progress_interval=float(jobs_cfg.get("progress_interval", 5)),
+        )
         try:
             if stage == "import":
                 return import_name_list(
@@ -136,6 +154,7 @@ class JobRunner:
                     self.cfg,
                     limit=payload.get("limit"),
                     checkpoint=control.checkpoint,
+                    progress=control.update_progress,
                 )
             if stage == "history":
                 return fetch_history_for_accounts(
@@ -144,6 +163,7 @@ class JobRunner:
                     self.cfg,
                     limit_accounts=payload.get("limit"),
                     checkpoint=control.checkpoint,
+                    progress=control.update_progress,
                 )
             if stage == "content":
                 return fetch_pending_contents(
@@ -152,6 +172,7 @@ class JobRunner:
                     self.cfg,
                     limit=payload.get("limit"),
                     checkpoint=control.checkpoint,
+                    progress=control.update_progress,
                 )
             raise ValueError(f"unsupported job stage: {stage}")
         finally:
@@ -174,3 +195,6 @@ class JobRunner:
             ),
         )
         self.event(job_id, status, f"任务状态：{status}", result)
+        self.db.cleanup_job_events(
+            int(self.cfg.get("jobs", {}).get("event_retention_days", 30))
+        )

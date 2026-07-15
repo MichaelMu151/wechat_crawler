@@ -16,8 +16,15 @@ crawl:
   sleep_max: 9
   # 历史列表每页条数（微信接口通常为 10）
   history_page_size: 10
+  # 账号与正文都按有界批次读取，避免十万/百万行一次性进入内存
+  account_batch_size: 200
+  content_batch_size: 500
   # 正文失败最多重试次数
   content_max_retries: 3
+  # 微信返回访问频繁时使用长冷却，不快速轮换所有会话
+  history_rate_limit_retries: 2
+  history_rate_limit_cooldown: 300
+  content_rate_limit_cooldown: 900
   # User-Agent：模拟微信内置浏览器
   user_agent: >-
     Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)
@@ -38,3 +45,13 @@ http:
 jobs:
   # 历史列表接口对并发敏感，默认只运行一个持久任务
   workers: 1
+  heartbeat_interval: 10
+  progress_interval: 5
+  event_retention_days: 30
+
+database:
+  # SQLite 单机大库的保守参数；cache_size_kib 使用负数表示 KiB
+  synchronous: NORMAL
+  cache_size_kib: -65536
+  mmap_size: 268435456
+  wal_autocheckpoint: 1000

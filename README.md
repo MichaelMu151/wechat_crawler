@@ -4,6 +4,28 @@
 
 > 重要：本项目不会替你登录微信，也不会控制微信客户端。“挂微信号”在本文档中是指：由使用者在自己的微信客户端中正常登录，通过抓包取得短期有效的 `uin`、`key` 和 `Cookie`，再将它们写入本地会话文件。凭据过期后需要重新获取。
 
+## 2026.7.15 大批量续航更新
+
+本次更新针对 10 万至百万篇文章的单机长期归档，核心目标是有界内存、可中断、可重启续跑和可观测，而不是提高微信请求并发。
+
+- 历史抓取修复断点回调覆盖问题；账号改为分批读取，增量水位可在任意分页停止，避免有新文章时重新翻完整个历史。
+- 微信会话失效与访问频率限制分别处理：会话失效才切换 session；限流则保持当前 session 并执行可取消、持续心跳的长冷却，避免快速轮换导致更多账号被风控。
+- 正文队列按 `content_batch_size` 循环读取，不再一次性把全部待抓文章放入内存；请求、重试和冷却期间均可响应取消。
+- 正文限流保持 `retry_wait` 并使用独立长退避，不会因几次短重试就把大量文章永久标为 `failed`。
+- 后台任务新增持久化进度、同阶段任务去重和重启自动续跑；管理台可查看进度、取消任务，并在空闲时降低轮询频率。
+- SQLite 增加待处理队列、规范化 URL 和文章游标排序索引；全文搜索优先使用 FTS5，文章列表使用 keyset cursor，避免百万行深分页的 `OFFSET` 退化。
+- FTS 更新触发器只在被索引字段真正变化时工作，减少重复增量历史造成的写放大；正文成功后清理不再需要的 `raw_list_json`。
+- 新增 `backup-db` 和 `maintain-db`：前者使用 SQLite online backup API 创建一致性备份，后者执行快速完整性检查、查询统计优化、事件清理和 WAL 截断。
+- 新增 `scripts/benchmark_scale.py` 合成规模基准，默认生成 10 万篇元数据，也可通过 `--rows 1000000` 检查百万行环境。
+
+百万篇全文仍有明确的物理成本：若每篇 HTML 平均 100 KB，仅 HTML 约占 100 GB；加上纯文本、FTS、WAL 和备份，建议预留 150–250 GB SSD 空间。默认仍保持 `jobs.workers: 1`，不要通过提高历史抓取并发换取速度。
+
+本次在 macOS/Python 3.14 环境完成了合成元数据实测（不包含真实大体积 HTML）：
+
+- 10 万行：写入 52.4 秒，待处理队列查询 12ms，首页 7ms，游标页 6ms，FTS 搜索 65ms，数据库约 48.3 MiB。
+- 100 万行：写入 558.1 秒，待处理队列查询 100ms，首页和游标页均为 24ms，FTS 搜索 729ms，数据库约 473.9 MiB。
+- 100 万行深 `OFFSET` 页耗时 338ms，约为游标页的 14 倍，因此 Web 管理台默认使用 keyset cursor；具体结果仍会随磁盘、正文长度和查询词变化。
+
 ## 2026.7.12 更新内容
 
 本次更新以“保守优化”为原则，没有提高默认并发或缩短请求间隔，重点放在长时间运行时的稳定性、任务可控性和 Web 管理台的基础使用体验。
@@ -772,10 +794,24 @@ python run.py serve --port 8001
 data/wechat_archive.db
 ```
 
-建议在停止程序后备份：
+推荐使用 SQLite online backup API；即使数据库处于 WAL 模式，也能生成一致性单文件备份：
 
 ```bash
-cp data/wechat_archive.db "data/wechat_archive-$(date +%Y%m%d).db"
+python run.py backup-db
+python run.py backup-db --out /Volumes/Backup/wechat_archive.db
+```
+
+长期运行后建议在没有抓取任务写入时定期维护：
+
+```bash
+python run.py maintain-db --event-retention-days 30
+```
+
+规模基准：
+
+```bash
+python scripts/benchmark_scale.py
+python scripts/benchmark_scale.py --rows 1000000 --database data/benchmark-1m.db
 ```
 
 导出：

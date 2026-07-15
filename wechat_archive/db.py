@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -116,8 +116,9 @@ ACCOUNT_COLUMNS = {
 
 
 class Database:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, options: dict[str, Any] | None = None):
         self.path = Path(path)
+        self.options = options or {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -126,6 +127,19 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(
+            f"PRAGMA synchronous={self.options.get('synchronous', 'NORMAL')}"
+        )
+        conn.execute(
+            f"PRAGMA cache_size={int(self.options.get('cache_size_kib', -65536))}"
+        )
+        conn.execute(
+            f"PRAGMA mmap_size={int(self.options.get('mmap_size', 268435456))}"
+        )
+        conn.execute(
+            "PRAGMA wal_autocheckpoint="
+            f"{int(self.options.get('wal_autocheckpoint', 1000))}"
+        )
         return conn
 
     def _init_schema(self) -> None:
@@ -135,7 +149,15 @@ class Database:
             self._ensure_columns(conn, "accounts", ACCOUNT_COLUMNS)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_articles_retry "
-                "ON articles(status, next_retry_at)"
+                "ON articles(status, next_retry_at, id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_articles_normalized_url "
+                "ON articles(normalized_url)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_articles_list "
+                "ON articles(COALESCE(publish_ts, 0) DESC, id DESC)"
             )
             self._init_fts(conn)
 
@@ -162,15 +184,28 @@ class Database:
             )
             conn.executescript(
                 """
-                CREATE TRIGGER IF NOT EXISTS articles_fts_ai AFTER INSERT ON articles BEGIN
+                DROP TRIGGER IF EXISTS articles_fts_ai;
+                DROP TRIGGER IF EXISTS articles_fts_ad;
+                DROP TRIGGER IF EXISTS articles_fts_au;
+                """
+            )
+            conn.executescript(
+                """
+                CREATE TRIGGER articles_fts_ai AFTER INSERT ON articles BEGIN
                     INSERT INTO articles_fts(rowid, title, author, digest, content_text)
                     VALUES (new.id, new.title, new.author, new.digest, new.content_text);
                 END;
-                CREATE TRIGGER IF NOT EXISTS articles_fts_ad AFTER DELETE ON articles BEGIN
+                CREATE TRIGGER articles_fts_ad AFTER DELETE ON articles BEGIN
                     INSERT INTO articles_fts(articles_fts, rowid, title, author, digest, content_text)
                     VALUES ('delete', old.id, old.title, old.author, old.digest, old.content_text);
                 END;
-                CREATE TRIGGER IF NOT EXISTS articles_fts_au AFTER UPDATE ON articles BEGIN
+                CREATE TRIGGER articles_fts_au AFTER UPDATE OF
+                    title, author, digest, content_text ON articles
+                WHEN old.title IS NOT new.title
+                  OR old.author IS NOT new.author
+                  OR old.digest IS NOT new.digest
+                  OR old.content_text IS NOT new.content_text
+                BEGIN
                     INSERT INTO articles_fts(articles_fts, rowid, title, author, digest, content_text)
                     VALUES ('delete', old.id, old.title, old.author, old.digest, old.content_text);
                     INSERT INTO articles_fts(rowid, title, author, digest, content_text)
@@ -244,3 +279,71 @@ class Database:
                 (f"-{stale_minutes} minutes",),
             ).rowcount
         return {"accounts": accounts, "jobs": jobs}
+
+    def recover_interrupted_jobs(self) -> dict[str, int]:
+        """Requeue jobs owned by a previous local server process."""
+        with self.connection() as conn:
+            cancelled = conn.execute(
+                """
+                UPDATE jobs SET status='cancelled',
+                    finished_at=datetime('now','localtime')
+                WHERE status IN ('pending','running') AND cancel_requested=1
+                """
+            ).rowcount
+            pending = conn.execute(
+                """
+                UPDATE jobs SET status='pending', error=NULL, finished_at=NULL
+                WHERE status='running' AND cancel_requested=0
+                """
+            ).rowcount
+            accounts = conn.execute(
+                """
+                UPDATE accounts
+                SET list_status='failed', list_error='interrupted; safe to retry',
+                    updated_at=datetime('now','localtime')
+                WHERE list_status='running'
+                """
+            ).rowcount
+        return {"jobs_requeued": pending, "jobs_cancelled": cancelled, "accounts": accounts}
+
+    def cleanup_job_events(self, retention_days: int = 30) -> int:
+        with self.connection() as conn:
+            return conn.execute(
+                """
+                DELETE FROM job_events
+                WHERE created_at < datetime('now', ?, 'localtime')
+                """,
+                (f"-{max(1, retention_days)} days",),
+            ).rowcount
+
+    def fts_available(self) -> bool:
+        row = self.fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='articles_fts'"
+        )
+        return row is not None
+
+    def backup(self, destination: str | Path) -> Path:
+        destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        source = self._connect()
+        target = sqlite3.connect(destination_path)
+        try:
+            source.backup(target, pages=1000, sleep=0.05)
+        finally:
+            target.close()
+            source.close()
+        return destination_path
+
+    def maintain(self, event_retention_days: int = 30) -> dict[str, Any]:
+        deleted_events = self.cleanup_job_events(event_retention_days)
+        with self.connection() as conn:
+            integrity = conn.execute("PRAGMA quick_check").fetchone()[0]
+            conn.execute("ANALYZE")
+            conn.execute("PRAGMA optimize")
+        with self._connect() as conn:
+            checkpoint = tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+        return {
+            "integrity": integrity,
+            "deleted_events": deleted_events,
+            "wal_checkpoint": checkpoint,
+        }

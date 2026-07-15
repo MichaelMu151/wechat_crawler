@@ -15,20 +15,21 @@ from pydantic import BaseModel, Field
 
 from wechat_archive.config import ensure_dirs, load_config
 from wechat_archive.db import Database
+from wechat_archive.services.article_queries import article_page
 from wechat_archive.services.jobs import JobRunner
 from wechat_archive.services.sessions import load_sessions
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
 cfg = load_config(os.environ.get("WECHAT_ARCHIVE_CONFIG"))
 ensure_dirs(cfg)
-db = Database(cfg["paths"]["database"])
+db = Database(cfg["paths"]["database"], cfg.get("database"))
 runner = JobRunner(db, cfg, workers=int(cfg.get("jobs", {}).get("workers", 1)))
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    stale_minutes = int(cfg.get("jobs", {}).get("stale_minutes", 30))
-    db.recover_stale_work(stale_minutes=stale_minutes)
+    db.recover_interrupted_jobs()
+    db.cleanup_job_events(int(cfg.get("jobs", {}).get("event_retention_days", 30)))
     runner.resume_pending()
     yield
     runner.executor.shutdown(wait=False, cancel_futures=False)
@@ -171,40 +172,19 @@ def articles(
     account_id: int | None = None,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    before_ts: int | None = None,
+    before_id: int | None = None,
 ) -> dict[str, Any]:
-    clauses: list[str] = []
-    params: list[Any] = []
-    if status:
-        clauses.append("ar.status=?")
-        params.append(status)
-    if account_id:
-        clauses.append("ar.account_id=?")
-        params.append(account_id)
-    if q:
-        clauses.append(
-            "(ar.title LIKE ? OR ar.author LIKE ? OR ar.digest LIKE ? "
-            "OR ar.content_text LIKE ?)"
-        )
-        term = f"%{q}%"
-        params.extend([term, term, term, term])
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    total = db.fetchone(
-        f"SELECT COUNT(*) count FROM articles ar {where}", tuple(params)
+    return article_page(
+        db=db,
+        q=q,
+        status=status,
+        account_id=account_id,
+        limit=limit,
+        offset=offset,
+        before_ts=before_ts,
+        before_id=before_id,
     )
-    params.extend([limit, offset])
-    rows = db.fetchall(
-        f"""
-        SELECT ar.id, ar.account_id, ar.title, ar.author, ar.digest,
-               ar.publish_time, ar.url, ar.cover_url, ar.status,
-               ar.retry_count, ar.content_error, a.account_name
-        FROM articles ar JOIN accounts a ON a.id=ar.account_id
-        {where}
-        ORDER BY COALESCE(ar.publish_ts, 0) DESC, ar.id DESC
-        LIMIT ? OFFSET ?
-        """,
-        tuple(params),
-    )
-    return {"items": [dict(row) for row in rows], "total": total["count"] if total else 0}
 
 
 @app.get("/api/v1/articles/{article_id}")
@@ -265,7 +245,10 @@ async def job_events(job_id: int) -> StreamingResponse:
         last_id = 0
         while True:
             events = db.fetchall(
-                "SELECT * FROM job_events WHERE job_id=? AND id>? ORDER BY id",
+                """
+                SELECT * FROM job_events
+                WHERE job_id=? AND id>? ORDER BY id LIMIT 100
+                """,
                 (job_id, last_id),
             )
             for event in events:
@@ -274,7 +257,7 @@ async def job_events(job_id: int) -> StreamingResponse:
             job = db.fetchone("SELECT status FROM jobs WHERE id=?", (job_id,))
             if job and job["status"] in {"done", "failed", "cancelled"} and not events:
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

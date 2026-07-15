@@ -19,8 +19,13 @@ type Job = {
   stage: string;
   status: string;
   created_at: string;
+  heartbeat_at?: string;
+  progress_current: number;
+  progress_total?: number;
+  result?: Record<string, unknown>;
   error?: string;
 };
+type Cursor = { before_ts: number; before_id: number };
 
 const PAGE_SIZE = 50;
 const STATUS_OPTIONS = ["", "ok", "listed", "retry_wait", "failed", "deleted", "out_of_range"];
@@ -60,7 +65,9 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
-  const [offset, setOffset] = useState(0);
+  const [cursor, setCursor] = useState<Cursor | null>(null);
+  const [cursorHistory, setCursorHistory] = useState<(Cursor | null)[]>([]);
+  const [nextCursor, setNextCursor] = useState<Cursor | null>(null);
   const [publicUrl, setPublicUrl] = useState("");
   const [preview, setPreview] = useState<number | null>(null);
   const [error, setError] = useState("");
@@ -71,42 +78,51 @@ export default function App() {
     try {
       const params = new URLSearchParams({
         limit: String(PAGE_SIZE),
-        offset: String(offset),
       });
       if (debouncedQuery) params.set("q", debouncedQuery);
       if (statusFilter) params.set("status", statusFilter);
+      if (cursor) {
+        params.set("before_ts", String(cursor.before_ts));
+        params.set("before_id", String(cursor.before_id));
+      }
       const [nextStats, articlePage, nextJobs] = await Promise.all([
         api<Stats>("/api/v1/stats"),
-        api<{ items: Article[]; total: number }>(`/api/v1/articles?${params}`),
+        api<{ items: Article[]; total: number; next_cursor: Cursor | null }>(
+          `/api/v1/articles?${params}`,
+        ),
         api<Job[]>("/api/v1/jobs"),
       ]);
       setStats(nextStats);
       setArticles(articlePage.items);
       setArticleTotal(articlePage.total);
+      setNextCursor(articlePage.next_cursor);
       setJobs(nextJobs);
       setError("");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "加载失败");
     }
-  }, [debouncedQuery, offset, statusFilter]);
+  }, [cursor, debouncedQuery, statusFilter]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setDebouncedQuery(query.trim());
-      setOffset(0);
+      setCursor(null);
+      setCursorHistory([]);
     }, 400);
     return () => window.clearTimeout(timer);
   }, [query]);
 
   useEffect(() => {
-    setOffset(0);
+    setCursor(null);
+    setCursorHistory([]);
   }, [statusFilter]);
 
+  const hasActiveJobs = jobs.some((job) => job.status === "pending" || job.status === "running");
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
+    const timer = window.setInterval(() => void refresh(), hasActiveJobs ? 3000 : 15000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [hasActiveJobs, refresh]);
 
   const run = async (stage: string) => {
     setPendingAction(stage);
@@ -148,13 +164,45 @@ export default function App() {
 
   const manualRefresh = async () => {
     setRefreshing(true);
-    await refresh();
-    setRefreshing(false);
+    try {
+      await refresh();
+    } finally {
+      setRefreshing(false);
+    }
   };
 
-  const page = Math.floor(offset / PAGE_SIZE) + 1;
+  const cancelJob = async (jobId: number) => {
+    setError("");
+    try {
+      await api(`/api/v1/jobs/${jobId}/cancel`, { method: "POST" });
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "取消任务失败");
+    }
+  };
+
+  const nextPage = () => {
+    if (!nextCursor) return;
+    setCursorHistory((history) => [...history, cursor]);
+    setCursor(nextCursor);
+  };
+
+  const previousPage = () => {
+    setCursorHistory((history) => {
+      if (!history.length) return history;
+      setCursor(history[history.length - 1]);
+      return history.slice(0, -1);
+    });
+  };
+
+  const page = cursorHistory.length + 1;
   const totalPages = Math.max(1, Math.ceil(articleTotal / PAGE_SIZE));
   const hasRunningAction = pendingAction !== null;
+  const activeStages = new Set(
+    jobs
+      .filter((job) => job.status === "pending" || job.status === "running")
+      .map((job) => job.stage),
+  );
 
   return (
     <main>
@@ -187,7 +235,7 @@ export default function App() {
           {["import", "resolve", "history", "content"].map((stage) => (
             <button
               className={stage === "content" ? "primary" : undefined}
-              disabled={hasRunningAction}
+              disabled={hasRunningAction || activeStages.has(stage)}
               key={stage}
               onClick={() => void run(stage)}
             >
@@ -250,13 +298,10 @@ export default function App() {
             {!articles.length && <p className="empty">暂无匹配文章</p>}
           </div>
           <div className="pager">
-            <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>
+            <button disabled={!cursorHistory.length} onClick={previousPage}>
               上一页
             </button>
-            <button
-              disabled={offset + PAGE_SIZE >= articleTotal}
-              onClick={() => setOffset(offset + PAGE_SIZE)}
-            >
+            <button disabled={!nextCursor} onClick={nextPage}>
               下一页
             </button>
           </div>
@@ -269,9 +314,25 @@ export default function App() {
               <div className="row" key={job.id}>
                 <span>
                   <strong>#{job.id} {STAGE_LABELS[job.stage] || job.stage}</strong>
-                  <small>{job.created_at}{job.error ? ` · ${job.error}` : ""}</small>
+                  <small>
+                    {job.created_at}
+                    {job.progress_total != null
+                      ? ` · ${job.progress_current.toLocaleString()} / ${job.progress_total.toLocaleString()}`
+                      : ""}
+                    {job.error ? ` · ${job.error}` : ""}
+                  </small>
+                  {job.progress_total != null && job.progress_total > 0 && (
+                    <progress value={job.progress_current} max={job.progress_total} />
+                  )}
                 </span>
-                <Status value={job.status} />
+                <span className="jobControls">
+                  <Status value={job.status} />
+                  {(job.status === "pending" || job.status === "running") && (
+                    <button className="smallButton" onClick={() => void cancelJob(job.id)}>
+                      取消
+                    </button>
+                  )}
+                </span>
               </div>
             ))}
             {!jobs.length && <p className="empty">尚未创建任务</p>}

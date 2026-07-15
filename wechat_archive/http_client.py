@@ -20,7 +20,8 @@ class HttpClient:
             read=int(http.get("max_retries", 3)),
             status=int(http.get("max_retries", 3)),
             backoff_factor=float(http.get("backoff_factor", 1.0)),
-            status_forcelist=(408, 425, 429, 500, 502, 503, 504),
+            # 429 is handled by the crawl services with long, cancellable cooldowns.
+            status_forcelist=(408, 425, 500, 502, 503, 504),
             allowed_methods=frozenset({"GET", "HEAD"}),
             respect_retry_after_header=True,
             raise_on_status=False,
@@ -57,6 +58,8 @@ class HttpClient:
 
     def get_text(self, url: str, **kwargs) -> tuple[str, str]:
         resp = self.get(url, **kwargs)
+        if resp.status_code == 429:
+            raise RuntimeError("rate_limited")
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding or "utf-8"
         return resp.url, resp.text
