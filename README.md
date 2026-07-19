@@ -293,7 +293,7 @@ Android 的操作名称可能是“修改网络 → 高级选项 → 代理 → 
 iPhone：
 
 1. 保持手机代理已连接。
-2. 用 Safari 打开 `https://chls.pro/ssl`。
+2. 用 Safari 打开 `http://ssl.charles/`。
 3. 下载 Charles 证书描述文件。
 4. 打开“设置 → 通用 → VPN 与设备管理”，安装该描述文件。
 5. 打开“设置 → 通用 → 关于本机 → 证书信任设置”。
