@@ -195,13 +195,18 @@ class PlatformClient:
         if ret in (None, 0, "0"):
             return
         message = f"{context} failed: ret={ret} msg={err}"
-        if ret in (200003, 200013, -3) or any(
-            k in err for k in ("invalid session", "登录", "过期", "失效")
+        err_l = err.lower()
+        # 限流优先于登录态判断（ret=200013 常见为频控，不是过期）
+        if ret in (200013, -6) or any(
+            k in err for k in ("频繁", "freq control", "too many")
         ):
-            raise PlatformAuthError(message)
-        if ret in (200013,) or any(k in err for k in ("频繁", "freq", "limit")):
             raise PlatformRateLimited(message)
-        if ret == 200002 or "invalid args" in err:
+        # 与 wechat-download-api 一致：200003 / 200040 为登录失效
+        if ret in (200003, 200040, -3) or any(
+            k in err_l for k in ("invalid session", "csrf", "login")
+        ) or any(k in err for k in ("登录", "过期", "失效")):
+            raise PlatformAuthError(message)
+        if ret == 200002 or "invalid arg" in err_l:
             raise PlatformAPIError(
                 f"{context}: fakeid 无效或公众号不可访问 (ret={ret}, msg={err})"
             )
@@ -245,12 +250,19 @@ class PlatformClient:
         return out
 
     def resolve_fakeid(self, nickname: str) -> dict[str, Any]:
-        """按昵称精确优先匹配 fakeid。"""
+        """按昵称精确匹配 fakeid；无精确命中则报错（避免绑错号）。"""
         accounts = self.search_accounts(nickname)
         if not accounts:
             raise PlatformAPIError(f"未搜索到公众号: {nickname}")
-        exact = [a for a in accounts if a["nickname"] == nickname]
-        chosen = exact[0] if exact else accounts[0]
+        exact = [a for a in accounts if a.get("nickname") == nickname]
+        if not exact:
+            candidates = "、".join(
+                f"{a.get('nickname')}({a.get('fakeid')})" for a in accounts[:5]
+            )
+            raise PlatformAPIError(
+                f"无精确匹配昵称「{nickname}」，候选: {candidates}"
+            )
+        chosen = exact[0]
         if not chosen.get("fakeid"):
             raise PlatformAPIError(f"搜索结果缺少 fakeid: {nickname}")
         return chosen
@@ -322,8 +334,14 @@ class DownloadApiClient:
         if not accounts:
             raise PlatformAPIError(f"未搜索到公众号: {nickname}")
         exact = [a for a in accounts if a.get("nickname") == nickname]
-        chosen = exact[0] if exact else accounts[0]
-        return chosen
+        if not exact:
+            candidates = "、".join(
+                f"{a.get('nickname')}({a.get('fakeid')})" for a in accounts[:5]
+            )
+            raise PlatformAPIError(
+                f"无精确匹配昵称「{nickname}」，候选: {candidates}"
+            )
+        return exact[0]
 
     def list_articles(
         self,
@@ -351,13 +369,17 @@ class DownloadApiClient:
             articles.append(_normalize_list_item(item))
         total = int(data.get("total") or 0)
         begin_v = int(data.get("begin") or begin)
-        count_v = len(articles)
-        can_continue = (begin_v + count_v) < total and count_v > 0
+        # download-api 的 begin/count 与公众平台一致，按请求 count 推进
+        requested = min(max(count, 1), 100)
+        next_begin = begin_v + requested
+        can_continue = len(articles) > 0 and (total <= 0 or next_begin < total)
         return {
             "articles": articles,
             "total": total,
             "begin": begin_v,
-            "count": count_v,
+            "count": len(articles),
+            "publish_fetched": requested,
+            "next_begin": next_begin,
             "can_continue": can_continue,
         }
 
@@ -370,7 +392,8 @@ def parse_publish_page(result: dict[str, Any], begin: int = 0) -> dict[str, Any]
         raise PlatformAPIError("publish_page 格式错误")
 
     articles: list[dict[str, Any]] = []
-    for item in publish_page.get("publish_list") or []:
+    publish_list = publish_page.get("publish_list") or []
+    for item in publish_list:
         publish_info = item.get("publish_info") or {}
         if isinstance(publish_info, str):
             try:
@@ -382,14 +405,18 @@ def parse_publish_page(result: dict[str, Any], begin: int = 0) -> dict[str, Any]
         for article in publish_info.get("appmsgex") or []:
             articles.append(_normalize_list_item(article))
 
+    # begin/count/total_count 以「推送次数 publish」计，不是展开后的文章数
     total = int(publish_page.get("total_count") or 0)
-    count_v = len(articles)
-    can_continue = (begin + count_v) < total and count_v > 0
+    publish_fetched = len(publish_list)
+    next_begin = begin + publish_fetched
+    can_continue = publish_fetched > 0 and (total <= 0 or next_begin < total)
     return {
         "articles": articles,
         "total": total,
         "begin": begin,
-        "count": count_v,
+        "count": len(articles),
+        "publish_fetched": publish_fetched,
+        "next_begin": next_begin,
         "can_continue": can_continue,
     }
 
@@ -446,4 +473,8 @@ def build_history_client(cfg: dict[str, Any]):
             "或运行 python run.py set-platform-creds"
         )
     ua = (cfg.get("crawl") or {}).get("platform_user_agent")
-    return PlatformClient(creds, timeout=timeout, user_agent=ua)
+    proxies = None
+    proxy = (cfg.get("http") or {}).get("proxy")
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
+    return PlatformClient(creds, timeout=timeout, user_agent=ua, proxies=proxies)

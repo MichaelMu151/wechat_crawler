@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import random
-import time
-from typing import Any
+from typing import Any, Callable
 
 from wechat_archive.db import Database
 from wechat_archive.http_client import HttpClient
@@ -13,6 +12,7 @@ from wechat_archive.platform_client import (
     build_history_client,
     load_platform_credentials,
 )
+from wechat_archive.services.job_control import JobCancelled, cooperative_sleep
 
 
 def resolve_pending_accounts(
@@ -20,10 +20,12 @@ def resolve_pending_accounts(
     client: HttpClient,
     cfg: dict[str, Any],
     limit: int | None = None,
+    checkpoint: Callable[[], None] | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, int]:
     """解析账号标识。
 
-    优先使用公众平台 searchbiz（昵称 → fakeid）；
+    优先使用公众平台 searchbiz（昵称精确匹配 → fakeid）；
     若无平台凭证或搜索失败，再回退到样例文章链接解析 __biz。
     """
     sleep_min = cfg["crawl"]["sleep_min"]
@@ -50,21 +52,34 @@ def resolve_pending_accounts(
         platform = None
 
     ok = fail = 0
+    total = len(rows)
+    if progress:
+        progress(0, total)
+
     for i, row in enumerate(rows):
+        if checkpoint:
+            checkpoint()
         account_id = row["id"]
         nickname = row["nickname_input"]
         sample_url = row["sample_url"]
         try:
             resolved = None
+            resolve_notes: list[str] = []
             if platform is not None:
                 try:
                     resolved = _resolve_via_platform(platform, nickname)
-                except (PlatformAPIError, PlatformAuthError):
+                except PlatformAuthError as exc:
+                    # 登录态失效：停止平台搜索，后续账号改走样例链接
+                    platform = None
+                    resolve_notes.append(f"platform auth failed: {exc}")
+                except PlatformAPIError as exc:
+                    resolve_notes.append(str(exc))
                     resolved = None
             if resolved is None:
                 if not sample_url:
+                    detail = "；".join(resolve_notes) or "无平台命中"
                     raise RuntimeError(
-                        "平台搜索失败且缺少 sample_url，无法解析 fakeid/__biz"
+                        f"无法解析 fakeid/__biz（{detail}），且缺少 sample_url"
                     )
                 resolved = _resolve_via_sample(client, sample_url, nickname)
 
@@ -111,6 +126,8 @@ def resolve_pending_accounts(
                         ),
                     )
                     ok += 1
+        except JobCancelled:
+            raise
         except Exception as e:
             with db.connection() as conn:
                 conn.execute(
@@ -125,10 +142,12 @@ def resolve_pending_accounts(
                 )
             fail += 1
 
-        if i < len(rows) - 1:
-            time.sleep(random.uniform(sleep_min, sleep_max))
+        if progress:
+            progress(i + 1, total)
+        if i < total - 1:
+            cooperative_sleep(random.uniform(sleep_min, sleep_max), checkpoint)
 
-    return {"ok": ok, "fail": fail, "total": len(rows)}
+    return {"ok": ok, "fail": fail, "total": total}
 
 
 def _resolve_via_platform(platform: Any, nickname: str) -> dict[str, Any]:

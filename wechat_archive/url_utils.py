@@ -8,9 +8,11 @@ TRACKING_PARAMS = {
     "enterid",
     "from",
     "isappinstalled",
+    "nwr_flag",
     "scene",
     "sessionid",
     "subscene",
+    "wx_header",
 }
 
 

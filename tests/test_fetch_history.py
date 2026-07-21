@@ -33,6 +33,8 @@ class FakePlatform:
             "total": 1,
             "begin": 0,
             "count": 1,
+            "publish_fetched": 1,
+            "next_begin": 1,
             "can_continue": False,
         }
 

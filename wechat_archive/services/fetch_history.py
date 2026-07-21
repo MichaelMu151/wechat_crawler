@@ -106,7 +106,12 @@ def fetch_history_for_accounts(
             articles_added += result["articles_upserted"]
             if progress:
                 progress(processed_accounts, accounts_total)
-            if processed_accounts < accounts_total:
+            if result.get("rate_limited"):
+                cooperative_sleep(
+                    float(cfg["crawl"].get("history_rate_limit_cooldown", 300)),
+                    checkpoint,
+                )
+            elif processed_accounts < accounts_total:
                 cooperative_sleep(
                     random.uniform(sleep_min, sleep_max), checkpoint
                 )
@@ -263,12 +268,13 @@ def _fetch_history_for_account(
                         ),
                         updated_at=datetime('now','localtime')
                     """,
-                    (account_id, offset + page_size, newest_seen),
+                    (account_id, int(page.get("next_begin") or (offset + page_size)), newest_seen),
                 )
 
             if reached_old or not can_continue or not rows:
                 break
-            offset += page_size
+            # 按 publish 偏移推进，避免多图文展开导致跳页
+            offset = int(page.get("next_begin") or (offset + page_size))
             cooperative_sleep(random.uniform(sleep_min, sleep_max), checkpoint)
 
         with db.connection() as conn:
@@ -301,7 +307,12 @@ def _fetch_history_for_account(
             """,
             (str(e)[:500], account_id),
         )
-        raise
+        return {
+            "accounts_ok": 0,
+            "accounts_fail": 1,
+            "articles_upserted": articles_added,
+            "rate_limited": True,
+        }
     except HistorySessionError as e:
         with db.connection() as conn:
             conn.execute(
