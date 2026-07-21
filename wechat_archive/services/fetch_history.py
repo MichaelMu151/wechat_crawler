@@ -8,51 +8,41 @@ from urllib.parse import parse_qs, urlparse
 from wechat_archive.db import Database
 from wechat_archive.http_client import HttpClient
 from wechat_archive.parsers.article_html import normalize_content_url
-from wechat_archive.parsers.history_json import parse_history_payload
+from wechat_archive.platform_client import (
+    PlatformAPIError,
+    PlatformAuthError,
+    PlatformRateLimited,
+    build_history_client,
+)
 from wechat_archive.services.job_control import JobCancelled, cooperative_sleep
-from wechat_archive.services.sessions import load_sessions
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
 
-class SessionPool:
-    def __init__(self, sessions: list[dict[str, Any]]):
-        if not sessions:
-            raise RuntimeError(
-                "未找到可用微信会话。请复制 sessions/example_session.yaml "
-                "为 session_1.yaml 并填入 uin/key/cookie。"
-            )
-        self.sessions = sessions
-        self._i = 0
-
-    def next(self) -> dict[str, Any]:
-        s = self.sessions[self._i % len(self.sessions)]
-        self._i += 1
-        return s
-
-
 class HistorySessionError(RuntimeError):
-    """The current WeChat session is no longer usable."""
+    """公众平台登录态不可用。"""
 
 
 class HistoryRateLimited(RuntimeError):
-    """WeChat asked the crawler to slow down."""
+    """公众平台限流。"""
 
 
 def fetch_history_for_accounts(
     db: Database,
-    client: HttpClient,
+    client: HttpClient | None,
     cfg: dict[str, Any],
     limit_accounts: int | None = None,
     checkpoint: Callable[[], None] | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, int]:
-    """对已解析 biz 的账号拉取历史列表（需会话）。"""
-    sessions = load_sessions(cfg["paths"]["sessions_dir"])
-    pool = SessionPool(sessions)
+    """对已解析 fakeid/biz 的账号拉取历史列表（公众平台 appmsgpublish）。"""
+    # client 参数保留兼容旧签名；平台模式使用独立 HTTP 会话
+    _ = client
+    platform = build_history_client(cfg)
 
     sleep_min = cfg["crawl"]["sleep_min"]
     sleep_max = cfg["crawl"]["sleep_max"]
-    page_size = cfg["crawl"].get("history_page_size", 10)
+    page_size = int(cfg["crawl"].get("history_page_size", 20))
+    page_size = min(max(page_size, 1), 100)
     start = datetime.strptime(cfg["crawl"]["start_date"], "%Y-%m-%d")
     end = datetime.strptime(cfg["crawl"]["end_date"], "%Y-%m-%d").replace(
         hour=23, minute=59, second=59
@@ -103,9 +93,8 @@ def fetch_history_for_accounts(
             processed_accounts += 1
             result = _fetch_history_for_account(
                 db=db,
-                client=client,
+                platform=platform,
                 cfg=cfg,
-                pool=pool,
                 acc=acc,
                 start_ts=start_ts,
                 end_ts=end_ts,
@@ -132,9 +121,8 @@ def fetch_history_for_accounts(
 
 def _fetch_history_for_account(
     db: Database,
-    client: HttpClient,
+    platform: Any,
     cfg: dict[str, Any],
-    pool: SessionPool,
     acc: Any,
     start_ts: int,
     end_ts: int,
@@ -142,7 +130,7 @@ def _fetch_history_for_account(
     checkpoint: Callable[[], None] | None,
 ) -> dict[str, int]:
     account_id = acc["id"]
-    biz = acc["biz"]
+    fakeid = acc["biz"]
     sleep_min = cfg["crawl"]["sleep_min"]
     sleep_max = cfg["crawl"]["sleep_max"]
     with db.connection() as conn:
@@ -170,25 +158,24 @@ def _fetch_history_for_account(
     newest_seen = previous_watermark
     reached_old = False
     articles_added = 0
+    rate_limit_retries = int(cfg["crawl"].get("history_rate_limit_retries", 2))
+    rate_limit_cooldown = float(cfg["crawl"].get("history_rate_limit_cooldown", 300))
+
     try:
         while True:
             if checkpoint:
                 checkpoint()
-            payload = _request_history_with_failover(
-                client=client,
-                biz=biz,
-                offset=offset,
+            page = _request_history_page(
+                platform=platform,
+                fakeid=fakeid,
+                begin=offset,
                 count=page_size,
-                pool=pool,
-                rate_limit_retries=int(
-                    cfg["crawl"].get("history_rate_limit_retries", 2)
-                ),
-                rate_limit_cooldown=float(
-                    cfg["crawl"].get("history_rate_limit_cooldown", 300)
-                ),
+                rate_limit_retries=rate_limit_retries,
+                rate_limit_cooldown=rate_limit_cooldown,
                 checkpoint=checkpoint,
             )
-            rows, can_continue = parse_history_payload(payload)
+            rows = page.get("articles") or []
+            can_continue = bool(page.get("can_continue"))
 
             with db.connection() as conn:
                 for row in rows:
@@ -215,9 +202,9 @@ def _fetch_history_for_account(
                         continue
                     content_url = normalize_content_url(url)
                     normalized_url = normalize_article_url(content_url)
-                    sn = article_sn(content_url)
+                    sn = article_sn(content_url) or row.get("aid")
                     query = parse_qs(urlparse(url).query)
-                    mid = query.get("mid", [None])[0]
+                    mid = row.get("mid") or query.get("mid", [None])[0]
                     cursor = conn.execute(
                         """
                         INSERT INTO articles (
@@ -245,7 +232,7 @@ def _fetch_history_for_account(
                         """,
                         (
                             account_id,
-                            biz,
+                            fakeid,
                             sn,
                             mid,
                             row.get("idx"),
@@ -315,6 +302,21 @@ def _fetch_history_for_account(
             (str(e)[:500], account_id),
         )
         raise
+    except HistorySessionError as e:
+        with db.connection() as conn:
+            conn.execute(
+                """
+                UPDATE accounts SET list_status='need_session', list_error=?,
+                    updated_at=datetime('now','localtime')
+                WHERE id=?
+                """,
+                (str(e)[:500], account_id),
+            )
+        return {
+            "accounts_ok": 0,
+            "accounts_fail": 1,
+            "articles_upserted": articles_added,
+        }
     except Exception as e:
         msg = str(e)
         status = "need_session" if _is_session_error(msg) else "failed"
@@ -334,109 +336,39 @@ def _fetch_history_for_account(
         }
 
 
+def _request_history_page(
+    platform: Any,
+    fakeid: str,
+    begin: int,
+    count: int,
+    rate_limit_retries: int,
+    rate_limit_cooldown: float,
+    checkpoint: Callable[[], None] | None,
+) -> dict[str, Any]:
+    for rate_attempt in range(rate_limit_retries + 1):
+        try:
+            return platform.list_articles(fakeid=fakeid, begin=begin, count=count)
+        except PlatformRateLimited as exc:
+            if rate_attempt >= rate_limit_retries:
+                raise HistoryRateLimited(str(exc)) from exc
+            cooperative_sleep(rate_limit_cooldown, checkpoint)
+        except PlatformAuthError as exc:
+            raise HistorySessionError(str(exc)) from exc
+        except PlatformAPIError:
+            raise
+    raise HistoryRateLimited("history rate limited")
+
+
 def _is_session_error(msg: str) -> bool:
-    keys = ("invalid session", "失效", "过期", "登录", "session expired")
-    return any(k in msg.lower() or k in msg for k in keys)
-
-
-def _is_rate_limit_error(msg: str) -> bool:
-    keys = ("频繁", "rate limit", "too many", "验证身份", "ret=-3", "ret=200013")
+    keys = (
+        "invalid session",
+        "失效",
+        "过期",
+        "登录",
+        "login",
+        "expired",
+        "session expired",
+        "未配置公众平台",
+    )
     lowered = msg.lower()
     return any(k in lowered or k in msg for k in keys)
-
-
-def _request_history_with_failover(
-    client: HttpClient,
-    biz: str,
-    offset: int,
-    count: int,
-    pool: SessionPool,
-    rate_limit_retries: int = 2,
-    rate_limit_cooldown: float = 300,
-    checkpoint: Callable[[], None] | None = None,
-) -> dict[str, Any]:
-    errors: list[str] = []
-    for _ in range(len(pool.sessions)):
-        session = pool.next()
-        for rate_attempt in range(rate_limit_retries + 1):
-            try:
-                return _request_history(
-                    client=client,
-                    biz=biz,
-                    offset=offset,
-                    count=count,
-                    session=session,
-                )
-            except HistoryRateLimited:
-                if rate_attempt >= rate_limit_retries:
-                    raise
-                cooperative_sleep(rate_limit_cooldown, checkpoint)
-            except HistorySessionError as exc:
-                errors.append(f"{session.get('name', 'session')}: {str(exc)[:200]}")
-                break
-            except Exception as exc:
-                message = str(exc)
-                if _is_rate_limit_error(message):
-                    if rate_attempt >= rate_limit_retries:
-                        raise HistoryRateLimited(message) from exc
-                    cooperative_sleep(rate_limit_cooldown, checkpoint)
-                    continue
-                if _is_session_error(message):
-                    errors.append(
-                        f"{session.get('name', 'session')}: {message[:200]}"
-                    )
-                    break
-                raise
-    raise HistorySessionError(
-        "all sessions failed for history page: " + " | ".join(errors)
-    )
-
-
-def _request_history(
-    client: HttpClient,
-    biz: str,
-    offset: int,
-    count: int,
-    session: dict[str, Any],
-) -> dict[str, Any]:
-    params = {
-        "action": "getmsg",
-        "__biz": biz,
-        "f": "json",
-        "offset": str(offset),
-        "count": str(count),
-        "uin": session["uin"],
-        "key": session["key"],
-    }
-    headers = {
-        "Cookie": session["cookie"],
-        "Referer": f"https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz={biz}&scene=124#wechat_redirect",
-    }
-    resp = client.get(
-        "https://mp.weixin.qq.com/mp/profile_ext",
-        params=params,
-        headers=headers,
-    )
-    if getattr(resp, "status_code", None) == 429:
-        raise HistoryRateLimited("history endpoint returned HTTP 429")
-    resp.raise_for_status()
-    try:
-        payload = resp.json()
-    except Exception:
-        # 有时返回 HTML
-        text = resp.text
-        if _is_rate_limit_error(text):
-            raise HistoryRateLimited(f"history rate limited: {text[:300]}")
-        if _is_session_error(text):
-            raise HistorySessionError(f"history session invalid: {text[:300]}")
-        raise RuntimeError(f"history non-json response: {text[:300]}")
-    err = (payload.get("base_resp") or {}).get("err_msg") or payload.get("errmsg")
-    ret = (payload.get("base_resp") or {}).get("ret")
-    if ret not in (None, 0, "0"):
-        message = f"history api error ret={ret} msg={err}"
-        if _is_rate_limit_error(message):
-            raise HistoryRateLimited(message)
-        if _is_session_error(message):
-            raise HistorySessionError(message)
-        raise RuntimeError(message)
-    return payload

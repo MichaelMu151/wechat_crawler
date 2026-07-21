@@ -4,7 +4,9 @@ type Stats = {
   accounts: { resolve_status: string; list_status: string; count: number }[];
   articles: Record<string, number>;
   jobs: Record<string, number>;
-  sessions: number;
+  sessions?: number;
+  platform_configured?: boolean;
+  platform_backend?: string;
 };
 type Article = {
   id: number;
@@ -223,7 +225,10 @@ export default function App() {
         <Metric label="文章总数" value={sum(stats?.articles)} />
         <Metric label="归档成功" value={stats?.articles.ok ?? 0} />
         <Metric label="等待处理" value={(stats?.articles.listed ?? 0) + (stats?.articles.retry_wait ?? 0)} />
-        <Metric label="有效会话" value={stats?.sessions ?? 0} />
+        <Metric
+          label="平台凭证"
+          value={stats?.platform_configured ? "已配置" : "未配置"}
+        />
       </section>
 
       <section className="panel actions">
@@ -356,7 +361,7 @@ export default function App() {
   );
 }
 
-function Metric({ label, value }: { label: string; value: number }) {
+function Metric({ label, value }: { label: string; value: number | string }) {
   return <article><span>{label}</span><strong>{value.toLocaleString()}</strong></article>;
 }
 

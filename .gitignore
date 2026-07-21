@@ -6,7 +6,9 @@ venv/
 data/*.db
 data/*.db-*
 sessions/session_*.yaml
+sessions/platform_credentials.yaml
 !sessions/example_session.yaml
+!sessions/platform_credentials.example.yaml
 .DS_Store
 *.log
 *.har

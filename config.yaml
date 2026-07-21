@@ -5,6 +5,15 @@ paths:
   name_list: ../name_list.xlsx
   database: data/wechat_archive.db
   sessions_dir: sessions
+  # 公众平台 token/cookie（替代已失效的个人微信 getmsg 抓包）
+  platform_credentials: sessions/platform_credentials.yaml
+
+# 历史列表后端：
+# - platform: 直接用公众号后台凭证调 searchbiz / appmsgpublish（推荐）
+# - download_api: 调用本地/远程 wechat-download-api HTTP 接口
+platform:
+  backend: platform
+  download_api_base_url: http://127.0.0.1:5000
 
 crawl:
   # 历史时间窗（含边界）
@@ -14,8 +23,8 @@ crawl:
   # 请求间隔（秒），慢速优先
   sleep_min: 4
   sleep_max: 9
-  # 历史列表每页条数（微信接口通常为 10）
-  history_page_size: 10
+  # 历史列表每页条数（appmsgpublish 最大 100；建议 10–20）
+  history_page_size: 20
   # 账号与正文都按有界批次读取，避免十万/百万行一次性进入内存
   account_batch_size: 200
   content_batch_size: 500

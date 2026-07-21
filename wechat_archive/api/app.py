@@ -17,7 +17,7 @@ from wechat_archive.config import ensure_dirs, load_config
 from wechat_archive.db import Database
 from wechat_archive.services.article_queries import article_page
 from wechat_archive.services.jobs import JobRunner
-from wechat_archive.services.sessions import load_sessions
+from wechat_archive.platform_client import load_platform_credentials
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
 cfg = load_config(os.environ.get("WECHAT_ARCHIVE_CONFIG"))
@@ -73,10 +73,13 @@ def row_dict(row: Any) -> dict[str, Any]:
 
 @app.get("/api/v1/health")
 def health() -> dict[str, Any]:
+    creds = load_platform_credentials(cfg)
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
     return {
         "status": "ok",
         "database": str(db.path),
-        "sessions": len(load_sessions(cfg["paths"]["sessions_dir"])),
+        "platform_backend": backend,
+        "platform_configured": bool(creds) or backend == "download_api",
     }
 
 
@@ -92,11 +95,15 @@ def stats() -> dict[str, Any]:
     job_rows = db.fetchall(
         "SELECT status, COUNT(*) AS count FROM jobs GROUP BY status"
     )
+    creds = load_platform_credentials(cfg)
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
     return {
         "accounts": [dict(row) for row in account_rows],
         "articles": {row["status"]: row["count"] for row in article_rows},
         "jobs": {row["status"]: row["count"] for row in job_rows},
-        "sessions": len(load_sessions(cfg["paths"]["sessions_dir"])),
+        "platform_backend": backend,
+        "platform_configured": bool(creds) or backend == "download_api",
+        "platform_source": creds.source if creds else None,
     }
 
 
@@ -264,11 +271,44 @@ async def job_events(job_id: int) -> StreamingResponse:
 
 @app.get("/api/v1/sessions")
 def sessions() -> list[dict[str, Any]]:
-    # Deliberately expose metadata only; credentials never cross the API.
+    """兼容旧前端：返回平台凭证元数据（不含 token/cookie）。"""
+    creds = load_platform_credentials(cfg)
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    if backend == "download_api":
+        return [
+            {
+                "name": "download_api",
+                "configured": True,
+                "backend": backend,
+            }
+        ]
+    if not creds:
+        return []
     return [
-        {"name": session["name"], "configured": True}
-        for session in load_sessions(cfg["paths"]["sessions_dir"])
+        {
+            "name": creds.nickname or "platform",
+            "configured": True,
+            "backend": backend,
+            "source": creds.source,
+            "expired": creds.expired,
+        }
     ]
+
+
+@app.get("/api/v1/platform")
+def platform_info() -> dict[str, Any]:
+    creds = load_platform_credentials(cfg)
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    return {
+        "backend": backend,
+        "download_api_base_url": (cfg.get("platform") or {}).get(
+            "download_api_base_url"
+        ),
+        "configured": bool(creds) or backend == "download_api",
+        "source": creds.source if creds else None,
+        "nickname": creds.nickname if creds else None,
+        "expired": creds.expired if creds else None,
+    }
 
 
 web_dist = Path(__file__).resolve().parents[2] / "web_ui" / "dist"

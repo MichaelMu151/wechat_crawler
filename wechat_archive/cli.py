@@ -11,6 +11,15 @@ from rich.table import Table
 from wechat_archive.config import ensure_dirs, load_config
 from wechat_archive.db import Database
 from wechat_archive.http_client import HttpClient
+from wechat_archive.platform_client import (
+    PlatformAuthError,
+    PlatformCredentials,
+    build_history_client,
+    import_credentials_from_download_api_env,
+    load_platform_credentials,
+    platform_creds_path,
+    save_platform_credentials,
+)
 from wechat_archive.services.fetch_content import fetch_pending_contents
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 from wechat_archive.services.import_accounts import import_name_list
@@ -19,7 +28,6 @@ from wechat_archive.services.session_import import (
     SessionImportError,
     import_session_from_har,
 )
-from wechat_archive.services.sessions import load_sessions
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
 console = Console()
@@ -66,7 +74,7 @@ def import_list_cmd(ctx: click.Context, xlsx: str | None) -> None:
 @click.option("--limit", default=None, type=int, help="最多处理多少个账号")
 @click.pass_context
 def resolve_cmd(ctx: click.Context, limit: int | None) -> None:
-    """根据样例链接解析 __biz。"""
+    """解析公众号 fakeid/__biz（优先 searchbiz，回退样例链接）。"""
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)
@@ -75,6 +83,136 @@ def resolve_cmd(ctx: click.Context, limit: int | None) -> None:
     console.print(f"解析完成: {stats}")
     _seed_sample_articles(db)
     console.print("已将样例文章写入 articles（便于先试正文抓取）。")
+
+
+@cli.command("set-platform-creds")
+@click.option("--token", prompt=True, help="公众平台 token")
+@click.option("--cookie", prompt=True, help="公众平台 Cookie 整段")
+@click.option("--nickname", default="", help="登录的公众号昵称（可选）")
+@click.option("--fakeid", default="", help="登录公众号 fakeid（可选）")
+@click.option(
+    "--expire-days",
+    default=4,
+    show_default=True,
+    type=click.IntRange(1, 14),
+    help="本地记录的预计有效天数",
+)
+@click.pass_context
+def set_platform_creds_cmd(
+    ctx: click.Context,
+    token: str,
+    cookie: str,
+    nickname: str,
+    fakeid: str,
+    expire_days: int,
+) -> None:
+    """手动写入公众平台 token/cookie（推荐配合浏览器登录 mp.weixin.qq.com）。"""
+    import time
+
+    cfg = ctx.obj["cfg"]
+    creds = PlatformCredentials(
+        token=token.strip(),
+        cookie=cookie.strip(),
+        nickname=nickname.strip(),
+        fakeid=fakeid.strip(),
+        expire_time_ms=int((time.time() + expire_days * 24 * 3600) * 1000),
+        source="manual",
+    )
+    path = save_platform_credentials(cfg, creds)
+    console.print(f"[green]已保存公众平台凭证:[/green] {path}")
+
+
+@cli.command("import-platform-from-download-api")
+@click.option(
+    "--env",
+    "env_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="wechat-download-api 的 .env 路径",
+)
+@click.pass_context
+def import_platform_from_download_api_cmd(ctx: click.Context, env_path: Path) -> None:
+    """从 wechat-download-api 扫码登录后的 .env / credentials 导入凭证。"""
+    cfg = ctx.obj["cfg"]
+    try:
+        creds = import_credentials_from_download_api_env(env_path)
+    except PlatformAuthError as exc:
+        raise click.ClickException(str(exc)) from exc
+    path = save_platform_credentials(cfg, creds)
+    console.print(f"[green]已导入凭证:[/green] {path}")
+    if creds.nickname:
+        console.print(f"登录公众号: {creds.nickname}")
+
+
+@cli.command("platform-status")
+@click.pass_context
+def platform_status_cmd(ctx: click.Context) -> None:
+    """检查公众平台凭证与后端模式。"""
+    import time
+
+    cfg = ctx.obj["cfg"]
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    console.print(f"历史后端: {backend}")
+    if backend == "download_api":
+        base = (cfg.get("platform") or {}).get("download_api_base_url")
+        console.print(f"download_api: {base}")
+        try:
+            client = build_history_client(cfg)
+            # 轻量探测：空搜索不应抛未登录以外的错误
+            client.search_accounts("微信")
+            console.print("[green]download_api 可访问且已登录[/green]")
+        except Exception as exc:
+            console.print(f"[yellow]download_api 探测失败:[/yellow] {exc}")
+        return
+
+    creds = load_platform_credentials(cfg)
+    path = platform_creds_path(cfg)
+    if not creds:
+        console.print(f"[yellow]未配置凭证:[/yellow] {path}")
+        console.print(
+            "请先部署 wechat-download-api 扫码登录并导入，"
+            "或运行 python run.py set-platform-creds"
+        )
+        return
+    console.print(f"凭证文件: {path}")
+    console.print(f"来源: {creds.source}")
+    console.print(f"昵称: {creds.nickname or '(未填)'}")
+    if creds.expire_time_ms:
+        remain_h = (creds.expire_time_ms / 1000 - time.time()) / 3600
+        console.print(f"预计剩余: {remain_h:.1f} 小时")
+        if creds.expired:
+            console.print("[red]已过期，请重新登录并更新凭证[/red]")
+    try:
+        client = build_history_client(cfg)
+        hits = client.search_accounts(creds.nickname or "卫生健康")
+        console.print(f"[green]凭证可用[/green]（searchbiz 返回 {len(hits)} 条）")
+    except Exception as exc:
+        console.print(f"[red]凭证探测失败:[/red] {exc}")
+
+
+@cli.command("history")
+@click.option("--limit", default=None, type=int, help="最多处理多少个账号")
+@click.pass_context
+def history_cmd(ctx: click.Context, limit: int | None) -> None:
+    """拉取历史发文列表（需要公众平台凭证，不再依赖 getmsg 抓包）。"""
+    cfg = ctx.obj["cfg"]
+    db = _db(cfg)
+    try:
+        build_history_client(cfg)
+    except PlatformAuthError as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        console.print(
+            "推荐流程：\n"
+            "1. 启动 wechat-download-api 并扫码登录\n"
+            "2. python run.py import-platform-from-download-api "
+            "--env ../wechat-download-api-main/.env\n"
+            "或：python run.py set-platform-creds\n"
+            "然后：python run.py platform-status"
+        )
+        return
+    client = HttpClient(cfg)
+    stats = fetch_history_for_accounts(db, client, cfg, limit_accounts=limit)
+    console.print(f"历史列表完成: {stats}")
 
 
 @cli.command("import-session-har")
@@ -105,7 +243,12 @@ def import_session_har_cmd(
     overwrite: bool,
     delete_source: bool,
 ) -> None:
-    """从 Charles HAR 自动提取微信历史会话。"""
+    """[已弃用] 旧版个人微信 getmsg 抓包导入。历史列表请改用公众平台凭证。"""
+    console.print(
+        "[yellow]注意：微信改版后 profile_ext?action=getmsg 已不可靠。"
+        "请改用 python run.py import-platform-from-download-api "
+        "或 set-platform-creds。[/yellow]"
+    )
     cfg = ctx.obj["cfg"]
     try:
         result = import_session_from_har(
@@ -117,7 +260,7 @@ def import_session_har_cmd(
     except SessionImportError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    table = Table(title="微信会话导入成功")
+    table = Table(title="旧版微信会话导入成功（仅兼容保留）")
     table.add_column("字段")
     table.add_column("结果")
     table.add_row("名称", result["name"])
@@ -126,7 +269,6 @@ def import_session_har_cmd(
     table.add_row("捕获时间", result["captured_at"] or "HAR 中未提供")
     table.add_row("候选请求", str(result["candidates_found"]))
     console.print(table)
-    console.print("[green]已安全写入会话；不会在终端显示 uin、key 或 Cookie。[/green]")
 
     if delete_source:
         try:
@@ -136,34 +278,6 @@ def import_session_har_cmd(
             console.print(
                 f"[yellow]会话已导入，但无法删除 HAR，请手动删除: {exc}[/yellow]"
             )
-    else:
-        console.print(
-            "[yellow]HAR 含登录凭据。确认导入成功后请将其安全删除，"
-            "切勿上传或提交 Git。[/yellow]"
-        )
-
-
-@cli.command("history")
-@click.option("--limit", default=None, type=int, help="最多处理多少个账号")
-@click.pass_context
-def history_cmd(ctx: click.Context, limit: int | None) -> None:
-    """拉取历史发文列表（需要 sessions/*.yaml）。"""
-    cfg = ctx.obj["cfg"]
-    db = _db(cfg)
-    sessions = load_sessions(cfg["paths"]["sessions_dir"])
-    if not sessions:
-        console.print(
-            "[yellow]还没有可用会话。[/yellow]\n"
-            "推荐：从 Charles 导出 HAR，然后运行\n"
-            "python run.py import-session-har --file capture.har --delete-source\n"
-            "也可以手工复制 sessions/example_session.yaml 并填入参数。\n"
-            "详见 README。"
-        )
-        return
-    console.print(f"已加载 {len(sessions)} 个会话: {[s['name'] for s in sessions]}")
-    client = HttpClient(cfg)
-    stats = fetch_history_for_accounts(db, client, cfg, limit_accounts=limit)
-    console.print(f"历史列表完成: {stats}")
 
 
 @cli.command("content")
@@ -210,8 +324,24 @@ def status_cmd(ctx: click.Context) -> None:
         table2.add_row(row["status"], str(row["c"]))
     console.print(table2)
 
-    sessions = load_sessions(cfg["paths"]["sessions_dir"])
-    console.print(f"可用会话数: {len(sessions)}")
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    creds = load_platform_credentials(cfg)
+    if backend == "download_api":
+        console.print(
+            f"历史后端: download_api "
+            f"({(cfg.get('platform') or {}).get('download_api_base_url')})"
+        )
+    elif creds:
+        import time
+
+        remain = ""
+        if creds.expire_time_ms:
+            remain = (
+                f"，预计剩余 {(creds.expire_time_ms / 1000 - time.time()) / 3600:.1f}h"
+            )
+        console.print(f"公众平台凭证: 已配置（来源 {creds.source}{remain}）")
+    else:
+        console.print("公众平台凭证: [yellow]未配置[/yellow]")
     console.print(f"数据库: {cfg['paths']['database']}")
 
 
@@ -319,7 +449,7 @@ def maintain_db_cmd(ctx: click.Context, event_retention_days: int) -> None:
 @click.option("--limit", default=None, type=int, help="限制账号数")
 @click.pass_context
 def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
-    """一键试点：导入 → 解析 →（若有会话则拉历史）→ 抓正文。"""
+    """一键试点：导入 → 解析 →（若有平台凭证则拉历史）→ 抓正文。"""
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)
@@ -328,19 +458,25 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
     stats = import_name_list(db, cfg["paths"]["name_list"])
     console.print(stats)
 
-    console.print("[bold]2/4 解析 __biz[/bold]")
+    console.print("[bold]2/4 解析 fakeid/__biz[/bold]")
     stats = resolve_pending_accounts(db, client, cfg, limit=limit)
     console.print(stats)
     _seed_sample_articles(db)
 
-    sessions = load_sessions(cfg["paths"]["sessions_dir"])
-    if sessions:
-        console.print(f"[bold]3/4 拉取历史列表[/bold]（{len(sessions)} 个会话）")
+    platform_ok = False
+    try:
+        build_history_client(cfg)
+        platform_ok = True
+    except PlatformAuthError:
+        platform_ok = False
+
+    if platform_ok:
+        console.print("[bold]3/4 拉取历史列表[/bold]（公众平台）")
         stats = fetch_history_for_accounts(db, client, cfg, limit_accounts=limit)
         console.print(stats)
     else:
         console.print(
-            "[bold]3/4 跳过历史列表[/bold]（尚未配置 sessions；仅抓取样例文章正文）"
+            "[bold]3/4 跳过历史列表[/bold]（尚未配置公众平台凭证；仅抓取样例正文）"
         )
 
     console.print("[bold]4/4 抓取正文[/bold]")

@@ -1,14 +1,11 @@
-# 复制本文件为 session_1.yaml / session_2.yaml / session_3.yaml
-# 从 PC/手机微信抓包得到（打开任意公众号「历史消息」时的请求）
-#
-# 需要的字段通常来自：
-#   https://mp.weixin.qq.com/mp/profile_ext?action=getmsg&__biz=...&uin=...&key=...
-# Cookie 整段复制即可。
+# [已弃用] 旧版个人微信 getmsg 会话文件
+# 微信改版后 profile_ext?action=getmsg 已不可靠。
+# 请改用 sessions/platform_credentials.yaml
+# （python run.py import-platform-from-download-api 或 set-platform-creds）
 
 name: wechat_account_1
-enabled: true
+enabled: false
 uin: "REPLACE_ME"
 key: "REPLACE_ME"
 cookie: "REPLACE_ME"
-# 可选备注
-note: "抓包后填入；过期后需重新抓取"
+note: "deprecated — use platform_credentials.yaml"
