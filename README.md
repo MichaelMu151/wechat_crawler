@@ -380,6 +380,7 @@ wechat-work/
 | `need_session` | 登录过期 | 重新扫码并再次 import |
 | 名单读不到 | `name_list.xlsx` 位置不对 | 放在 `wechat-work/name_list.xlsx`（与两个仓库同级） |
 | 解析失败 | 昵称不完全一致 | 改成微信里显示的全名，或补上 `link` |
+| `lsof -i :5000` 看到 `ControlCe` 占用，`bash start.sh` 报 `ERROR: [Errno 48] address already in use` | macOS 的“隔空播放接收器”（AirPlay Receiver）占用了 5000 端口，且系统进程会自动重启，无法靠 `kill` 彻底杀掉 | **方案一（推荐）**：系统设置 → 通用 → 隔空播放与接力 → 关闭「隔空播放接收器」，再重新运行 `bash start.sh`。<br>**方案二（备选）**：用 `PORT=5001 SITE_URL=http://127.0.0.1:5001 bash start.sh` 换端口启动，然后访问 `http://127.0.0.1:5001/login.html` |
 
 ---
 
