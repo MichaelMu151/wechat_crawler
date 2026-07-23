@@ -210,6 +210,128 @@ python run.py export-jsonl
 
 ---
 
+## 如何理解 `python run.py status` 的两张表
+
+执行 `status` 后通常会看到类似：
+
+```text
+          账号状态
+┏━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┓
+┃ resolve ┃ list    ┃ count ┃
+┡━━━━━━━━━╇━━━━━━━━━╇━━━━━━━┩
+│ ok      │ done    │     1 │
+│ ok      │ pending │     1 │
+│ pending │ pending │     9 │
+└─────────┴─────────┴───────┘
+        文章状态
+┏━━━━━━━━┳━━━━━━━┓
+┃ status ┃ count ┃
+┡━━━━━━━━╇━━━━━━━┩
+│ listed │  1299 │
+│ ok     │    10 │
+└────────┴───────┘
+```
+
+这不是报错，而是**进度看板**。上面管「公众号」，下面管「文章」。
+
+### 上面：账号状态（每个公众号一行汇总）
+
+每个公众号有两个阶段：
+
+| 列 | 含义 |
+|----|------|
+| `resolve` | 有没有解析出该号的 `fakeid`（平台 ID） |
+| `list` | 有没有拉完该号的**历史文章列表**（只有标题/链接/时间等元数据） |
+| `count` | 处于这种组合状态的公众号数量 |
+
+对上表示例的读法：
+
+| 组合 | 人数 | 意思 |
+|------|------|------|
+| `resolve=ok` + `list=done` | 1 | 已解析 ID，且历史列表已拉完 |
+| `resolve=ok` + `list=pending` | 1 | 已解析 ID，但历史列表还没拉（或还没轮到） |
+| `resolve=pending` + `list=pending` | 9 | 还没解析 ID（通常还没跑 `resolve`，或解析失败未重试） |
+
+常见 `resolve` 取值：
+
+- `pending`：未解析  
+- `ok`：已解析成功  
+- `failed`：解析失败（看库里的 `resolve_error`，或重跑 `resolve`）
+
+常见 `list` 取值：
+
+- `pending`：未拉历史列表  
+- `running`：正在拉  
+- `done`：该号历史列表已完成  
+- `failed`：拉列表失败  
+- `need_session`：登录凭证失效，需重新扫码并 `import-platform-from-download-api`
+
+对应下一步：
+
+```bash
+# 还有 pending 的 resolve → 继续解析
+python run.py resolve
+
+# 已有 resolve=ok 但 list 仍是 pending → 继续拉历史
+python run.py history
+
+# list=need_session → 先重新登录再 history
+python run.py import-platform-from-download-api
+python run.py history
+```
+
+### 下面：文章状态（每篇文章一条）
+
+历史列表拉下来后，先只有「目录信息」；正文要另一步 `content` 去抓。
+
+| status | 含义 | 下一步 |
+|--------|------|--------|
+| `listed` | 已在列表里（有标题/链接等），**正文还没抓**或未成功 | `python run.py content` |
+| `ok` | 正文已抓成功（HTML + 纯文本都有） | 可分析 / `export-jsonl` |
+| `failed` | 正文抓取失败 | `python run.py retry-failed` 后再 `content` |
+| `deleted` | 原文已失效/删除 | 一般无需处理，仅作记录 |
+| `out_of_range` | 发布时间不在 `config.yaml` 的时间窗内 | 若需要可改时间窗后重跑 |
+| `retry_wait` | 临时失败，等待自动/稍后重试 | 再跑 `content` |
+
+对上表示例的读法：
+
+- `listed = 1299`：已经知道有 1299 篇文章的元数据，但正文还在排队  
+- `ok = 10`：其中 10 篇正文已抓完（例如你用过 `--limit 10`）
+
+所以整体进度可以理解为：
+
+```text
+11 个公众号里：
+  1 个：ID 已解析 + 列表已拉完
+  1 个：ID 已解析 + 列表还没拉
+  9 个：ID 都还没解析
+
+文章：
+  1309 篇已进入数据库（1299 + 10）
+  其中 10 篇正文完成，1299 篇还差正文
+```
+
+### 推荐操作顺序（对照状态）
+
+```text
+import-list  →  账号出现在库里（resolve/list 多为 pending）
+resolve      →  resolve 变为 ok
+history      →  list 变为 done，同时 listed 文章变多
+content      →  listed 逐步变成 ok
+export-jsonl →  默认导出 status=ok 的文章
+```
+
+若你只想先看正文是否正常，可以：
+
+```bash
+python run.py content --limit 10
+python run.py status
+```
+
+看到 `ok` 增加、`listed` 减少（或减少幅度等于本次成功数），就说明正文链路正常；然后再去掉 `--limit` 慢慢跑完。
+
+---
+
 ## 第 8 步：用 Python 分析
 
 ```python
