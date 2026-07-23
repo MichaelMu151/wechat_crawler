@@ -1,19 +1,25 @@
-# 试点配置：可按需修改
+# 默认约定：两个仓库同级放置
+#
+#   wechat-work/
+#     name_list.xlsx
+#     wechat_crawler/          ← 本项目
+#     wechat-download-api/     ← 另一个 GitHub 仓库
 
 paths:
-  # 默认读取上级目录的名单；也可改成项目内路径
+  # 名单默认放在上一级工作目录（与两个仓库同级）
   name_list: ../name_list.xlsx
   database: data/wechat_archive.db
   sessions_dir: sessions
-  # 公众平台 token/cookie（替代已失效的个人微信 getmsg 抓包）
   platform_credentials: sessions/platform_credentials.yaml
 
 # 历史列表后端：
 # - platform: 直接用公众号后台凭证调 searchbiz / appmsgpublish（推荐）
-# - download_api: 调用本地/远程 wechat-download-api HTTP 接口
+# - download_api: 调用同级 wechat-download-api 的 HTTP 接口
 platform:
   backend: platform
   download_api_base_url: http://127.0.0.1:5000
+  # import-platform-from-download-api 未传 --env 时使用此路径
+  download_api_env: ../wechat-download-api/.env
 
 crawl:
   # 历史时间窗（含边界）

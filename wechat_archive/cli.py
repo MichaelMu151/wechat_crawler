@@ -126,20 +126,38 @@ def set_platform_creds_cmd(
 @click.option(
     "--env",
     "env_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=True,
-    help="wechat-download-api 的 .env 路径",
+    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+    default=None,
+    help="wechat-download-api 的 .env；默认读 config.yaml 的 platform.download_api_env",
 )
 @click.pass_context
-def import_platform_from_download_api_cmd(ctx: click.Context, env_path: Path) -> None:
+def import_platform_from_download_api_cmd(
+    ctx: click.Context, env_path: Path | None
+) -> None:
     """从 wechat-download-api 扫码登录后的 .env / credentials 导入凭证。"""
     cfg = ctx.obj["cfg"]
+    resolved = env_path
+    if resolved is None:
+        raw = (cfg.get("platform") or {}).get("download_api_env")
+        if not raw:
+            raise click.ClickException(
+                "未指定 --env，且 config.yaml 中没有 platform.download_api_env。"
+                "同级布局默认应为 ../wechat-download-api/.env"
+            )
+        resolved = Path(raw)
+    if not resolved.exists():
+        raise click.ClickException(
+            f"找不到凭证文件: {resolved}\n"
+            "请确认已 clone wechat-download-api 到同级目录，并完成扫码登录。\n"
+            "期望布局: wechat-work/{wechat_crawler, wechat-download-api}/"
+        )
     try:
-        creds = import_credentials_from_download_api_env(env_path)
+        creds = import_credentials_from_download_api_env(resolved)
     except PlatformAuthError as exc:
         raise click.ClickException(str(exc)) from exc
     path = save_platform_credentials(cfg, creds)
     console.print(f"[green]已导入凭证:[/green] {path}")
+    console.print(f"来源文件: {resolved}")
     if creds.nickname:
         console.print(f"登录公众号: {creds.nickname}")
 
@@ -170,8 +188,9 @@ def platform_status_cmd(ctx: click.Context) -> None:
     if not creds:
         console.print(f"[yellow]未配置凭证:[/yellow] {path}")
         console.print(
-            "请先部署 wechat-download-api 扫码登录并导入，"
-            "或运行 python run.py set-platform-creds"
+            "请先在同级目录启动 wechat-download-api 并扫码，然后执行:\n"
+            "  python run.py import-platform-from-download-api\n"
+            "（默认读取 ../wechat-download-api/.env）"
         )
         return
     console.print(f"凭证文件: {path}")
@@ -203,11 +222,11 @@ def history_cmd(ctx: click.Context, limit: int | None) -> None:
         console.print(f"[yellow]{exc}[/yellow]")
         console.print(
             "推荐流程：\n"
-            "1. 启动 wechat-download-api 并扫码登录\n"
-            "2. python run.py import-platform-from-download-api "
-            "--env ../wechat-download-api-main/.env\n"
-            "或：python run.py set-platform-creds\n"
-            "然后：python run.py platform-status"
+            "1. 同级目录 clone 并启动 wechat-download-api，浏览器扫码登录\n"
+            "2. python run.py import-platform-from-download-api\n"
+            "   （默认读取 ../wechat-download-api/.env）\n"
+            "3. python run.py platform-status\n"
+            "详见 README。"
         )
         return
     client = HttpClient(cfg)

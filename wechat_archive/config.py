@@ -27,8 +27,14 @@ def load_config(path: Path | str | None = None) -> dict[str, Any]:
         {
             "backend": "platform",
             "download_api_base_url": "http://127.0.0.1:5000",
+            "download_api_env": "../wechat-download-api/.env",
         },
     )
+    # 解析 download_api_env 相对路径
+    platform = cfg["platform"]
+    env_path = platform.get("download_api_env")
+    if env_path and not Path(env_path).is_absolute():
+        platform["download_api_env"] = str((ROOT / env_path).resolve())
     return cfg
 
 
