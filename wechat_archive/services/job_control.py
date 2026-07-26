@@ -40,7 +40,9 @@ class JobControl:
         if row and row["cancel_requested"]:
             raise JobCancelled("任务已取消")
 
-    def update_progress(self, current: int, total: int | None = None) -> None:
+    def update_progress(
+        self, current: int, total: int | None = None, **_info: object
+    ) -> None:
         now = time.monotonic()
         if (
             current > 0

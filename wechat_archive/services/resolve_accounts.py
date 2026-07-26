@@ -21,7 +21,7 @@ def resolve_pending_accounts(
     cfg: dict[str, Any],
     limit: int | None = None,
     checkpoint: Callable[[], None] | None = None,
-    progress: Callable[[int, int], None] | None = None,
+    progress: Callable[..., None] | None = None,
 ) -> dict[str, int]:
     """解析账号标识。
 
@@ -54,7 +54,7 @@ def resolve_pending_accounts(
     ok = fail = 0
     total = len(rows)
     if progress:
-        progress(0, total)
+        progress(0, total, phase="解析账号")
 
     for i, row in enumerate(rows):
         if checkpoint:
@@ -62,6 +62,17 @@ def resolve_pending_accounts(
         account_id = row["id"]
         nickname = row["nickname_input"]
         sample_url = row["sample_url"]
+        if progress:
+            progress(
+                i,
+                total,
+                phase="解析账号",
+                account=nickname,
+                account_done=0,
+                account_total=1,
+                ok=ok,
+                failed=fail,
+            )
         try:
             resolved = None
             resolve_notes: list[str] = []
@@ -143,7 +154,16 @@ def resolve_pending_accounts(
             fail += 1
 
         if progress:
-            progress(i + 1, total)
+            progress(
+                i + 1,
+                total,
+                phase="解析账号",
+                account=nickname,
+                account_done=1,
+                account_total=1,
+                ok=ok,
+                failed=fail,
+            )
         if i < total - 1:
             cooperative_sleep(random.uniform(sleep_min, sleep_max), checkpoint)
 

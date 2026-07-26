@@ -207,6 +207,23 @@ python run.py export-jsonl
 
 - 数据库：`data/wechat_archive.db`  
 - 导出：`export/articles.jsonl`  
+- 进度日志：`data/logs/{resolve,history,content}_progress.jsonl`（每约 15 秒一行）
+
+运行 `resolve` / `history` / `content` 时，终端会显示**总进度条 + 当前账号进度**（完成数、速度、ETA、ok/fail）。
+
+### 提速相关配置（`config.yaml` → `crawl`）
+
+正文阶段通常最耗时。默认已做保守提速（目标约 **2×** 吞吐，遇限流会自动降速并冷却）：
+
+| 项 | 默认 | 说明 |
+|----|------|------|
+| `content_concurrency` | `2` | 同时抓几篇正文；不要盲目调到很大 |
+| `content_sleep_min` / `content_sleep_max` | `1.5` / `3.5` | 正文请求间隔（秒），与历史列表的 `sleep_*` 分开 |
+| `content_rate_limit_cooldown` | `600` | 触发「访问频繁」后的冷却秒数 |
+| `history_page_size` | `40` | 历史列表每页条数（最大 100） |
+| `sleep_min` / `sleep_max` | `3` / `6` | **仅**历史列表/解析的间隔 |
+
+若频繁出现 `retry_wait` / `rate_limited`：先把 `content_concurrency` 改为 `1`，并把 `content_sleep_*` 略调大。
 
 ---
 

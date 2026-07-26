@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Callable
 
@@ -15,29 +17,67 @@ class ContentRateLimited(RuntimeError):
     """The public article endpoint asked the crawler to slow down."""
 
 
+class AdaptiveDelay:
+    """成功时略降延迟，限流时抬升，避免长期固定慢速。"""
+
+    def __init__(self, sleep_min: float, sleep_max: float):
+        self.min_d = max(0.0, float(sleep_min))
+        self.max_d = max(self.min_d, float(sleep_max))
+        self.current = (self.min_d + self.max_d) / 2.0 if self.max_d > 0 else 0.0
+        self._success_streak = 0
+        self._lock = threading.Lock()
+
+    def next_delay(self) -> float:
+        with self._lock:
+            if self.current <= 0:
+                return 0.0
+            lo = max(self.min_d, self.current * 0.75)
+            hi = max(lo, min(self.max_d * 1.25, self.current * 1.25))
+            return random.uniform(lo, hi)
+
+    def on_success(self) -> None:
+        with self._lock:
+            self._success_streak += 1
+            if self._success_streak >= 25 and self.current > self.min_d:
+                self.current = max(self.min_d, self.current * 0.92)
+                self._success_streak = 0
+
+    def on_rate_limit(self) -> None:
+        with self._lock:
+            self._success_streak = 0
+            boosted = self.current * 1.7 if self.current > 0 else max(2.0, self.max_d)
+            self.current = min(max(self.max_d, 8.0), boosted)
+
+
 def fetch_pending_contents(
     db: Database,
     client: HttpClient,
     cfg: dict[str, Any],
     limit: int | None = None,
     checkpoint: Callable[[], None] | None = None,
-    progress: Callable[[int, int], None] | None = None,
+    progress: Callable[..., None] | None = None,
 ) -> dict[str, int]:
-    """Fetch listed/retryable content with bounded, observable retries."""
-    sleep_min = cfg["crawl"]["sleep_min"]
-    sleep_max = cfg["crawl"]["sleep_max"]
-    start = datetime.strptime(cfg["crawl"]["start_date"], "%Y-%m-%d")
-    end = datetime.strptime(cfg["crawl"]["end_date"], "%Y-%m-%d").replace(
+    """Fetch listed/retryable content with bounded concurrency and adaptive delay."""
+    crawl = cfg["crawl"]
+    sleep_min = float(crawl.get("content_sleep_min", crawl.get("sleep_min", 2)))
+    sleep_max = float(crawl.get("content_sleep_max", crawl.get("sleep_max", 4)))
+    concurrency = max(1, int(crawl.get("content_concurrency", 2)))
+    start = datetime.strptime(crawl["start_date"], "%Y-%m-%d")
+    end = datetime.strptime(crawl["end_date"], "%Y-%m-%d").replace(
         hour=23, minute=59, second=59
     )
     start_ts = int(start.timestamp())
     end_ts = int(end.timestamp())
 
-    max_retries = int(cfg["crawl"].get("content_max_retries", 3))
-    batch_size = max(1, int(cfg["crawl"].get("content_batch_size", 500)))
-    rate_limit_cooldown = max(
-        1, int(cfg["crawl"].get("content_rate_limit_cooldown", 900))
+    max_retries = int(crawl.get("content_max_retries", 3))
+    # 并发时用较小批次，降低整批打满后才发现限流的浪费
+    configured_batch = max(1, int(crawl.get("content_batch_size", 500)))
+    batch_size = (
+        min(configured_batch, max(concurrency * 8, concurrency))
+        if concurrency > 1
+        else configured_batch
     )
+    rate_limit_cooldown = max(1, int(crawl.get("content_rate_limit_cooldown", 600)))
 
     with db.connection() as conn:
         skipped = conn.execute(
@@ -65,20 +105,33 @@ def fetch_pending_contents(
     eligible_total = int(count_row["count"]) if count_row else 0
     target_total = min(eligible_total, limit) if limit is not None else eligible_total
     if progress:
-        progress(0, target_total)
+        progress(
+            0,
+            target_total,
+            phase="正文",
+            note=f"并发={concurrency}, 间隔≈{sleep_min}-{sleep_max}s",
+        )
 
     ok = deleted = failed = processed = 0
+    delay = AdaptiveDelay(sleep_min, sleep_max)
+    account_targets = _account_pending_counts(db, start_ts, end_ts)
+    account_done: dict[int, int] = {}
+    # requests.Session 连接池可并发；共用 client 保证测试桩与配置代理一致
+    shared_client = client
+
     while processed < target_total:
         current_batch_size = min(batch_size, target_total - processed)
         rows = db.fetchall(
             """
-            SELECT id, url, publish_ts, retry_count
-            FROM articles
-            WHERE status IN ('listed', 'retry_wait')
-              AND (next_retry_at IS NULL OR next_retry_at <= datetime('now','localtime'))
-              AND url IS NOT NULL AND url != ''
-              AND (publish_ts IS NULL OR publish_ts BETWEEN ? AND ?)
-            ORDER BY id
+            SELECT ar.id, ar.url, ar.publish_ts, ar.retry_count, ar.account_id,
+                   COALESCE(a.account_name, a.nickname_input, '') AS account_name
+            FROM articles ar
+            JOIN accounts a ON a.id = ar.account_id
+            WHERE ar.status IN ('listed', 'retry_wait')
+              AND (ar.next_retry_at IS NULL OR ar.next_retry_at <= datetime('now','localtime'))
+              AND ar.url IS NOT NULL AND ar.url != ''
+              AND (ar.publish_ts IS NULL OR ar.publish_ts BETWEEN ? AND ?)
+            ORDER BY ar.account_id, ar.id
             LIMIT ?
             """,
             (start_ts, end_ts, current_batch_size),
@@ -86,12 +139,14 @@ def fetch_pending_contents(
         if not rows:
             break
 
-        for row in rows:
+        def handle_one(row: Any) -> dict[str, Any]:
             if checkpoint:
                 checkpoint()
-            article_id = row["id"]
+            article_id = int(row["id"])
             url = row["url"]
             publish_ts = row["publish_ts"]
+            account_id = int(row["account_id"])
+            account_name = row["account_name"] or f"#{account_id}"
             parsed: dict[str, Any] | None = None
             last_error: Exception | None = None
             rate_limited = False
@@ -100,30 +155,71 @@ def fetch_pending_contents(
                 if checkpoint:
                     checkpoint()
                 try:
-                    final_url, html_text = client.get_text(url)
+                    wait = delay.next_delay()
+                    if wait > 0:
+                        cooperative_sleep(wait, checkpoint, slice_seconds=1.0)
+                    final_url, html_text = shared_client.get_text(url)
                     parsed = parse_article_html(html_text, final_url)
                     if parsed["status"] == "failed":
                         error = parsed.get("error") or "article parse failed"
                         if error == "rate_limited":
                             raise ContentRateLimited(error)
                         raise RuntimeError(error)
+                    delay.on_success()
                     break
                 except ContentRateLimited as exc:
                     last_error = exc
                     rate_limited = True
+                    delay.on_rate_limit()
                     break
                 except Exception as exc:
                     if "rate_limited" in str(exc).lower():
                         last_error = ContentRateLimited(str(exc))
                         rate_limited = True
+                        delay.on_rate_limit()
                         break
                     last_error = exc
                     if attempt < attempts_left - 1:
-                        delay = min(60.0, (2**attempt) + random.random())
-                        cooperative_sleep(delay, checkpoint)
+                        backoff = min(60.0, (2**attempt) + random.random())
+                        cooperative_sleep(backoff, checkpoint, slice_seconds=1.0)
+            return {
+                "article_id": article_id,
+                "url": url,
+                "account_id": account_id,
+                "account_name": account_name,
+                "publish_ts": publish_ts,
+                "retry_count": int(row["retry_count"]),
+                "attempts_left": attempts_left,
+                "rate_limited": rate_limited,
+                "parsed": parsed,
+                "error": last_error,
+            }
 
-            if rate_limited:
-                retry_count = int(row["retry_count"]) + 1
+        if concurrency == 1:
+            outcomes = [handle_one(row) for row in rows]
+        else:
+            outcomes = []
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [pool.submit(handle_one, row) for row in rows]
+                for fut in as_completed(futures):
+                    outcomes.append(fut.result())
+            outcomes.sort(key=lambda x: (x["account_id"], x["article_id"]))
+
+        hit_rate_limit = False
+        for outcome in outcomes:
+            if checkpoint:
+                checkpoint()
+            article_id = outcome["article_id"]
+            account_id = outcome["account_id"]
+            account_name = outcome["account_name"]
+            publish_ts = outcome["publish_ts"]
+            parsed = outcome["parsed"]
+            last_error = outcome["error"]
+            url = outcome["url"]
+
+            if outcome["rate_limited"]:
+                hit_rate_limit = True
+                retry_count = int(outcome["retry_count"]) + 1
                 db.execute(
                     """
                     UPDATE articles
@@ -138,9 +234,20 @@ def fetch_pending_contents(
                 )
                 failed += 1
                 processed += 1
+                account_done[account_id] = account_done.get(account_id, 0) + 1
                 if progress:
-                    progress(processed, target_total)
-                cooperative_sleep(rate_limit_cooldown, checkpoint)
+                    progress(
+                        processed,
+                        target_total,
+                        phase="正文",
+                        account=account_name,
+                        account_done=account_done[account_id],
+                        account_total=account_targets.get(account_id),
+                        ok=ok,
+                        failed=failed,
+                        deleted=deleted,
+                        note=f"触发限流，将冷却 {rate_limit_cooldown}s",
+                    )
                 continue
 
             try:
@@ -159,47 +266,46 @@ def fetch_pending_contents(
 
                 parsed_url = parsed.get("url") or url
                 sn = parsed.get("sn") or article_sn(parsed_url)
-                with db.connection() as conn:
-                    conn.execute(
-                        """
-                        UPDATE articles
-                        SET sn=COALESCE(?, sn), mid=COALESCE(?, mid),
-                            idx=COALESCE(?, idx), biz=COALESCE(?, biz),
-                            title=COALESCE(?, title), author=COALESCE(?, author),
-                            digest=COALESCE(?, digest), cover_url=COALESCE(?, cover_url),
-                            publish_ts=COALESCE(?, publish_ts),
-                            publish_time=COALESCE(?, publish_time),
-                            url=COALESCE(?, url),
-                            normalized_url=COALESCE(?, normalized_url),
-                            content_html=?, content_text=?, status=?,
-                            content_error=?, retry_count=0, next_retry_at=NULL,
-                            raw_list_json=NULL,
-                            last_fetched_at=datetime('now','localtime'),
-                            updated_at=datetime('now','localtime')
-                        WHERE id=?
-                        """,
-                        (
-                            sn,
-                            parsed.get("mid"),
-                            parsed.get("idx"),
-                            parsed.get("biz"),
-                            parsed.get("title"),
-                            parsed.get("author"),
-                            parsed.get("digest"),
-                            parsed.get("cover_url"),
-                            parsed.get("publish_ts"),
-                            parsed.get("publish_time"),
-                            parsed.get("url"),
-                            normalize_article_url(parsed_url),
-                            parsed.get("content_html"),
-                            parsed.get("content_text"),
-                            status,
-                            parsed.get("error"),
-                            article_id,
-                        ),
-                    )
+                db.execute(
+                    """
+                    UPDATE articles
+                    SET sn=COALESCE(?, sn), mid=COALESCE(?, mid),
+                        idx=COALESCE(?, idx), biz=COALESCE(?, biz),
+                        title=COALESCE(?, title), author=COALESCE(?, author),
+                        digest=COALESCE(?, digest), cover_url=COALESCE(?, cover_url),
+                        publish_ts=COALESCE(?, publish_ts),
+                        publish_time=COALESCE(?, publish_time),
+                        url=COALESCE(?, url),
+                        normalized_url=COALESCE(?, normalized_url),
+                        content_html=?, content_text=?, status=?,
+                        content_error=?, retry_count=0, next_retry_at=NULL,
+                        raw_list_json=NULL,
+                        last_fetched_at=datetime('now','localtime'),
+                        updated_at=datetime('now','localtime')
+                    WHERE id=?
+                    """,
+                    (
+                        sn,
+                        parsed.get("mid"),
+                        parsed.get("idx"),
+                        parsed.get("biz"),
+                        parsed.get("title"),
+                        parsed.get("author"),
+                        parsed.get("digest"),
+                        parsed.get("cover_url"),
+                        parsed.get("publish_ts"),
+                        parsed.get("publish_time"),
+                        parsed.get("url"),
+                        normalize_article_url(parsed_url),
+                        parsed.get("content_html"),
+                        parsed.get("content_text"),
+                        status,
+                        parsed.get("error"),
+                        article_id,
+                    ),
+                )
             except Exception as e:
-                retry_count = int(row["retry_count"]) + attempts_left
+                retry_count = int(outcome["retry_count"]) + int(outcome["attempts_left"])
                 retryable = retry_count < max_retries
                 db.execute(
                     """
@@ -225,10 +331,32 @@ def fetch_pending_contents(
                 failed += 1
 
             processed += 1
+            account_done[account_id] = account_done.get(account_id, 0) + 1
             if progress:
-                progress(processed, target_total)
-            if processed < target_total:
-                cooperative_sleep(random.uniform(sleep_min, sleep_max), checkpoint)
+                progress(
+                    processed,
+                    target_total,
+                    phase="正文",
+                    account=account_name,
+                    account_done=account_done[account_id],
+                    account_total=account_targets.get(account_id),
+                    ok=ok,
+                    failed=failed,
+                    deleted=deleted,
+                )
+
+        if hit_rate_limit and processed < target_total:
+            if progress:
+                progress(
+                    processed,
+                    target_total,
+                    phase="正文",
+                    note=f"限流冷却 {rate_limit_cooldown}s",
+                    ok=ok,
+                    failed=failed,
+                    deleted=deleted,
+                )
+            cooperative_sleep(rate_limit_cooldown, checkpoint, slice_seconds=5.0)
 
     return {
         "ok": ok,
@@ -236,4 +364,24 @@ def fetch_pending_contents(
         "failed": failed,
         "out_of_range": skipped,
         "total": processed + skipped,
+        "concurrency": concurrency,
+        "content_sleep": [sleep_min, sleep_max],
     }
+
+
+def _account_pending_counts(
+    db: Database, start_ts: int, end_ts: int
+) -> dict[int, int]:
+    rows = db.fetchall(
+        """
+        SELECT account_id, COUNT(*) AS count
+        FROM articles
+        WHERE status IN ('listed', 'retry_wait')
+          AND (next_retry_at IS NULL OR next_retry_at <= datetime('now','localtime'))
+          AND url IS NOT NULL AND url != ''
+          AND (publish_ts IS NULL OR publish_ts BETWEEN ? AND ?)
+        GROUP BY account_id
+        """,
+        (start_ts, end_ts),
+    )
+    return {int(r["account_id"]): int(r["count"]) for r in rows}

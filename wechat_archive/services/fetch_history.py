@@ -32,7 +32,7 @@ def fetch_history_for_accounts(
     cfg: dict[str, Any],
     limit_accounts: int | None = None,
     checkpoint: Callable[[], None] | None = None,
-    progress: Callable[[int, int], None] | None = None,
+    progress: Callable[..., None] | None = None,
 ) -> dict[str, int]:
     """对已解析 fakeid/biz 的账号拉取历史列表（公众平台 appmsgpublish）。"""
     # client 参数保留兼容旧签名；平台模式使用独立 HTTP 会话
@@ -67,7 +67,12 @@ def fetch_history_for_accounts(
     last_account_id = 0
     processed_accounts = 0
     if progress:
-        progress(0, accounts_total)
+        progress(
+            0,
+            accounts_total,
+            phase="历史列表",
+            note=f"每页 {page_size} 条, 间隔 {sleep_min}-{sleep_max}s",
+        )
 
     while processed_accounts < accounts_total:
         remaining = accounts_total - processed_accounts
@@ -90,7 +95,19 @@ def fetch_history_for_accounts(
                 checkpoint()
             account_id = acc["id"]
             last_account_id = account_id
-            processed_accounts += 1
+            account_name = acc["account_name"] or acc["nickname_input"] or f"#{account_id}"
+            if progress:
+                progress(
+                    processed_accounts,
+                    accounts_total,
+                    phase="历史列表",
+                    account=account_name,
+                    account_done=0,
+                    account_total=None,
+                    ok=account_ok,
+                    failed=account_fail,
+                    note=f"累计入库 {articles_added}",
+                )
             result = _fetch_history_for_account(
                 db=db,
                 platform=platform,
@@ -100,12 +117,29 @@ def fetch_history_for_accounts(
                 end_ts=end_ts,
                 page_size=page_size,
                 checkpoint=checkpoint,
+                progress=progress,
+                overall_current=processed_accounts,
+                overall_total=accounts_total,
+                overall_ok=account_ok,
+                overall_fail=account_fail,
+                overall_articles=articles_added,
             )
+            processed_accounts += 1
             account_ok += result["accounts_ok"]
             account_fail += result["accounts_fail"]
             articles_added += result["articles_upserted"]
             if progress:
-                progress(processed_accounts, accounts_total)
+                progress(
+                    processed_accounts,
+                    accounts_total,
+                    phase="历史列表",
+                    account=account_name,
+                    account_done=result["articles_upserted"],
+                    account_total=result["articles_upserted"] or None,
+                    ok=account_ok,
+                    failed=account_fail,
+                    note=f"累计入库 {articles_added}",
+                )
             if result.get("rate_limited"):
                 cooperative_sleep(
                     float(cfg["crawl"].get("history_rate_limit_cooldown", 300)),
@@ -133,9 +167,16 @@ def _fetch_history_for_account(
     end_ts: int,
     page_size: int,
     checkpoint: Callable[[], None] | None,
+    progress: Callable[..., None] | None = None,
+    overall_current: int = 0,
+    overall_total: int | None = None,
+    overall_ok: int = 0,
+    overall_fail: int = 0,
+    overall_articles: int = 0,
 ) -> dict[str, int]:
     account_id = acc["id"]
     fakeid = acc["biz"]
+    account_name = acc["account_name"] or acc["nickname_input"] or f"#{account_id}"
     sleep_min = cfg["crawl"]["sleep_min"]
     sleep_max = cfg["crawl"]["sleep_max"]
     with db.connection() as conn:
@@ -163,6 +204,7 @@ def _fetch_history_for_account(
     newest_seen = previous_watermark
     reached_old = False
     articles_added = 0
+    pages_done = 0
     rate_limit_retries = int(cfg["crawl"].get("history_rate_limit_retries", 2))
     rate_limit_cooldown = float(cfg["crawl"].get("history_rate_limit_cooldown", 300))
 
@@ -181,6 +223,7 @@ def _fetch_history_for_account(
             )
             rows = page.get("articles") or []
             can_continue = bool(page.get("can_continue"))
+            pages_done += 1
 
             with db.connection() as conn:
                 for row in rows:
@@ -269,6 +312,22 @@ def _fetch_history_for_account(
                         updated_at=datetime('now','localtime')
                     """,
                     (account_id, int(page.get("next_begin") or (offset + page_size)), newest_seen),
+                )
+
+            if progress:
+                progress(
+                    overall_current,
+                    overall_total,
+                    phase="历史列表",
+                    account=account_name,
+                    account_done=articles_added,
+                    account_total=None,
+                    ok=overall_ok,
+                    failed=overall_fail,
+                    note=(
+                        f"第 {pages_done} 页 · 本号入库 {articles_added} · "
+                        f"累计 {overall_articles + articles_added}"
+                    ),
                 )
 
             if reached_old or not can_continue or not rows:

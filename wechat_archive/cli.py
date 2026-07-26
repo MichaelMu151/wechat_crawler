@@ -20,6 +20,7 @@ from wechat_archive.platform_client import (
     platform_creds_path,
     save_platform_credentials,
 )
+from wechat_archive.progress_ui import CrawlProgress
 from wechat_archive.services.fetch_content import fetch_pending_contents
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 from wechat_archive.services.import_accounts import import_name_list
@@ -36,6 +37,11 @@ console = Console()
 def _db(cfg) -> Database:
     ensure_dirs(cfg)
     return Database(cfg["paths"]["database"], cfg.get("database"))
+
+
+def _progress_log_path(cfg: dict, name: str) -> Path:
+    db_path = Path(cfg["paths"]["database"])
+    return db_path.parent / "logs" / f"{name}_progress.jsonl"
 
 
 @click.group()
@@ -78,8 +84,14 @@ def resolve_cmd(ctx: click.Context, limit: int | None) -> None:
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)
-    console.print("开始解析账号…")
-    stats = resolve_pending_accounts(db, client, cfg, limit=limit)
+    with CrawlProgress(
+        title="解析账号",
+        log_path=_progress_log_path(cfg, "resolve"),
+        console=console,
+    ) as prog:
+        stats = resolve_pending_accounts(
+            db, client, cfg, limit=limit, progress=prog.callback
+        )
     console.print(f"解析完成: {stats}")
     _seed_sample_articles(db)
     console.print("已将样例文章写入 articles（便于先试正文抓取）。")
@@ -230,7 +242,14 @@ def history_cmd(ctx: click.Context, limit: int | None) -> None:
         )
         return
     client = HttpClient(cfg)
-    stats = fetch_history_for_accounts(db, client, cfg, limit_accounts=limit)
+    with CrawlProgress(
+        title="历史列表",
+        log_path=_progress_log_path(cfg, "history"),
+        console=console,
+    ) as prog:
+        stats = fetch_history_for_accounts(
+            db, client, cfg, limit_accounts=limit, progress=prog.callback
+        )
     console.print(f"历史列表完成: {stats}")
 
 
@@ -307,8 +326,14 @@ def content_cmd(ctx: click.Context, limit: int | None) -> None:
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)
-    console.print("开始抓取正文…")
-    stats = fetch_pending_contents(db, client, cfg, limit=limit)
+    with CrawlProgress(
+        title="抓取正文",
+        log_path=_progress_log_path(cfg, "content"),
+        console=console,
+    ) as prog:
+        stats = fetch_pending_contents(
+            db, client, cfg, limit=limit, progress=prog.callback
+        )
     console.print(f"正文抓取完成: {stats}")
 
 
@@ -478,7 +503,14 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
     console.print(stats)
 
     console.print("[bold]2/4 解析 fakeid/__biz[/bold]")
-    stats = resolve_pending_accounts(db, client, cfg, limit=limit)
+    with CrawlProgress(
+        title="解析账号",
+        log_path=_progress_log_path(cfg, "resolve"),
+        console=console,
+    ) as prog:
+        stats = resolve_pending_accounts(
+            db, client, cfg, limit=limit, progress=prog.callback
+        )
     console.print(stats)
     _seed_sample_articles(db)
 
@@ -491,7 +523,14 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
 
     if platform_ok:
         console.print("[bold]3/4 拉取历史列表[/bold]（公众平台）")
-        stats = fetch_history_for_accounts(db, client, cfg, limit_accounts=limit)
+        with CrawlProgress(
+            title="历史列表",
+            log_path=_progress_log_path(cfg, "history"),
+            console=console,
+        ) as prog:
+            stats = fetch_history_for_accounts(
+                db, client, cfg, limit_accounts=limit, progress=prog.callback
+            )
         console.print(stats)
     else:
         console.print(
@@ -499,7 +538,14 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
         )
 
     console.print("[bold]4/4 抓取正文[/bold]")
-    stats = fetch_pending_contents(db, client, cfg, limit=limit)
+    with CrawlProgress(
+        title="抓取正文",
+        log_path=_progress_log_path(cfg, "content"),
+        console=console,
+    ) as prog:
+        stats = fetch_pending_contents(
+            db, client, cfg, limit=limit, progress=prog.callback
+        )
     console.print(stats)
     ctx.invoke(status_cmd)
 
