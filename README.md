@@ -72,6 +72,20 @@ git checkout cursor/wechat-archive-enhancements
 cd ..
 ```
 
+由于代码会不时更新，所以如果不想从新创建一个文件夹的话，可以在如上创建的文件夹里（以wechat_work为例）：
+
+```bash
+# 1. 更新爬虫项目 (wechat_crawler)
+cd wechat_crawler
+git pull
+cd ..
+
+# 2. 更新扫码登录工具 (wechat-download-api)
+cd wechat-download-api
+git pull
+cd ..
+```
+
 ---
 
 ## 第 3 步：准备公众号名单 `name_list.xlsx`
