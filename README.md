@@ -118,7 +118,7 @@ python3 scripts/create_name_list_example.py --out ../name_list.xlsx
 
 ---
 
-## 第 4 步：安装爬虫（只需一次）
+## 第 4 步：安装爬虫（每次更新之后建议在安装一次）
 
 ```bash
 cd "$HOME/Desktop/wechat-work/wechat_crawler"
