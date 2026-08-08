@@ -269,7 +269,7 @@ python run.py history --refresh
 
 ```bash
 python run.py --profile safe history     # 历史极慢、熔断严、正文 concurrency=1
-python run.py --profile balanced …       # 与当前 config.yaml 目标接近
+python run.py --profile balanced history/content/doctor       # 与当前 config.yaml 目标接近
 python run.py --profile fast content     # 仅正文略激进；历史仍保守
 
 # 等价：整份安全配置
