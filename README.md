@@ -200,64 +200,140 @@ cd "$HOME/Desktop/wechat-work/wechat_crawler"
 source .venv/bin/activate
 
 # 1) 导入名单（默认读取上一级目录的 name_list.xlsx）
+#    可重复执行：已存在的 nickname+link 会 skipped，不会重复插入
 python run.py import-list
 
 # 2) 先小规模试跑
 python run.py resolve --limit 2
-python run.py history --limit 1
+python run.py --profile safe history --limit 1
 python run.py content --limit 10
 python run.py status
+python run.py doctor
 
-# 3) 确认无误后，去掉 --limit 做全量
+# 3) 确认无误后，去掉 --limit 做全量（历史建议先用 safe）
 # python run.py resolve
-# python run.py history
+# python run.py --profile safe history
 # python run.py content
 
-# 4) 导出
+# 4) 导出（文章明细 + 按账号汇总）
 python run.py export-jsonl
+python run.py export-account-summary
 ```
 
 结果位置（均在爬虫目录内）：
 
-- 数据库：`data/wechat_archive.db`  
-- 导出：`export/articles.jsonl`  
-- 进度日志：`data/logs/{resolve,history,content}_progress.jsonl`（每约 15 秒一行）
+| 路径 | 内容 |
+|------|------|
+| `data/wechat_archive.db` | SQLite 主库 |
+| `export/articles.jsonl` | 默认导出 `status=ok` 的文章 |
+| `export/account_summary.jsonl` | 按账号篇数、时间跨度、ok/failed/deleted 汇总 |
+| `data/logs/{resolve,history,content}_progress.jsonl` | 进度日志（约每 15 秒一行） |
 
 运行 `resolve` / `history` / `content` 时，终端会显示**总进度条 + 当前账号进度**（完成数、速度、ETA、ok/fail）。
 
-### 可持续爬取与提速（`config.yaml` / `--profile`）
+---
 
-历史列表接口极易 `freq control`（ret=200013）。默认策略：
+## 本次能力更新（可持续爬取 / 运维 / 呈现）
 
-- **`history` 默认跳过 `done`**，加 `--refresh` 才增量刷新已完成账号
-- **连续频控熔断**：达到阈值后停止遍历，避免空转十小时
-- **`list_error` 前缀**：`rate_limited:` / `auth:` / `api:` / `interrupted:`
-- **节奏档位**：`python run.py --profile safe|balanced|fast …`（或 `config.safe.yaml`）
+面向长跑与百万级档案，仓库已增强以下能力（分支 `cursor/wechat-archive-enhancements`）：
 
-| 项 | 默认 | 说明 |
-|----|------|------|
-| `sleep_min` / `sleep_max` | `10` / `20` | 历史列表/解析间隔（秒） |
-| `history_page_size` | `15` | 历史每页条数；成功会升、限流会降 |
-| `history_circuit_breaker_threshold` | `3` | 连续账号频控后熔断 |
-| `history_global_cooldown` | `3600` | 熔断后建议等待秒数 |
-| `content_concurrency` | `2` | 正文并发；勿盲目加大 |
-| `content_sleep_min` / `max` | `1.5` / `3.5` | 正文间隔 |
-| `content_circuit_breaker_threshold` | `5` | 正文连续限流后暂停 |
+### 1. 历史列表：防频控空转
 
-运维命令：
+公众平台 `appmsgpublish` 极易返回 `ret=200013`（`freq control`）。旧行为会**逐个账号烧冷却**，表现为进度条 `ok=0 fail` 一路涨、入库一直为 0。
+
+现在默认：
+
+| 行为 | 说明 |
+|------|------|
+| **跳过 `done`** | `history` 默认只处理 `pending` / `running` / `failed` / `retry_wait` / `need_session` |
+| **`--refresh`** | 才把已完成账号纳入增量刷新（按 watermark 停在已见文章） |
+| **连续频控熔断** | 连续多个账号触发限流后**停止继续扫号**，并提示建议等待时间 |
+| **错误前缀** | `list_error` 以 `rate_limited:` / `auth:` / `api:` / `interrupted:` 开头，便于归类 |
+| **限流状态** | 历史限流账号记为 `list_status=retry_wait`（可再跑 `history` 重试） |
 
 ```bash
-python run.py doctor              # 凭证/错误/建议下一步
-python run.py errors              # 错误聚合
-python run.py status              # 漏斗 + 建议动作
-python run.py status --json
+# 日常补拉（推荐）：跳过已完成，遇频控会熔断
 python run.py --profile safe history
-python run.py history --refresh   # 含 done 增量
-python run.py retry-resolve       # 重置 resolve=failed
+
+# 想检查已完成账号有没有新发文
+python run.py history --refresh
+```
+
+### 2. 正文抓取：有界并发 + 自适应间隔 + 熔断
+
+- 默认 `content_concurrency=2`，间隔与历史列表分开（`content_sleep_*`）
+- 成功多时略降速、遇限流抬升间隔；连续限流会**整批熔断暂停**
+- **不要**把并发盲目调到 4+；平台与正文配额不同，正文再快也救不了历史 `200013`
+
+### 3. 节奏档位 `--profile` / `config.safe.yaml`
+
+```bash
+python run.py --profile safe history     # 历史极慢、熔断严、正文 concurrency=1
+python run.py --profile balanced …       # 与当前 config.yaml 目标接近
+python run.py --profile fast content     # 仅正文略激进；历史仍保守
+
+# 等价：整份安全配置
+python run.py --config config.safe.yaml history
+```
+
+| 配置项（`config.yaml` → `crawl`） | 默认 | 说明 |
+|----------------------------------|------|------|
+| `sleep_min` / `sleep_max` | `10` / `20` | **仅**历史列表 / 解析间隔（秒） |
+| `history_page_size` | `15` | 每页条数；成功会升、限流会降到 `history_page_size_min` |
+| `history_circuit_breaker_threshold` | `3` | 连续账号频控后熔断 |
+| `history_global_cooldown` | `3600` | 熔断后建议等待秒数（进程内也会冷却） |
+| `history_rate_limit_cooldown` | `900` | 单次频控后的账号级冷却 |
+| `content_concurrency` | `2` | 正文并发 |
+| `content_sleep_min` / `content_sleep_max` | `1.5` / `3.5` | 正文间隔 |
+| `content_circuit_breaker_threshold` | `5` | 正文连续限流后暂停 |
+| `content_rate_limit_cooldown` | `600` | 正文限流冷却 |
+
+### 4. 运维命令（不用写 SQL）
+
+```bash
+python run.py doctor              # 凭证剩余、错误 Top、卡住 running、建议下一步
+python run.py errors              # list / resolve / content 错误聚合
+python run.py status              # 漏斗 + 错误分类 + 建议动作
+python run.py status --json       # 便于周报 / 脚本
+python run.py retry-resolve       # 把 resolve=failed 重置为 pending，再跑 resolve
+python run.py retry-failed        # 把正文 failed 重置为 listed，再跑 content
 python run.py export-account-summary
 ```
 
-若大量 `rate_limited`：先停跑，用 `--profile safe` 再跑 `history`。
+### 5. Web 管理台（可选）
+
+```bash
+cd web_ui && npm install && npm run build && cd ..
+python run.py serve
+# 浏览器打开 http://127.0.0.1:8000
+```
+
+看板可看统计、错误分类、建议动作，并提交 import / resolve / history / content 任务；支持「历史(含 done 刷新)」「重试解析失败」等按钮。
+
+### 6. 重要注意事项（请先读）
+
+1. **配额比速度更重要**：历史接口不要追求并发；账号级并行会更快触发 `200013`。  
+2. **看到大量 `rate_limited` / `freq control`：先 Ctrl+C 停跑**，等 1–2 小时（或更久），再用 `--profile safe history`。继续硬跑只会空转。  
+3. **`import-list` 全是 skipped**：名单已在库里，属正常；用 `status` / `doctor` 看下一步。  
+4. **`resolve` 返回 total=0**：没有 `pending` 可解析（失败号需先 `retry-resolve`）。  
+5. **`resolve=failed` 不会自动重试**：必须 `retry-resolve` 后再 `resolve`。  
+6. **凭证约 4 天过期**：`need_session` 或 `auth:` 错误 → 重新扫码并 `import-platform-from-download-api`。  
+7. **更新代码后**：`git pull`，并建议重新 `pip install -r requirements.txt`；若用 Web，需在 `web_ui` 里 `npm run build`。  
+8. **仅学术存档用途**：控制频率；不抓阅读量/点赞。
+
+### 推荐长跑流程
+
+```bash
+python run.py doctor
+# 若提示大量限流 → 等待后再继续
+
+python run.py --profile safe history     # 补历史列表（跳过 done）
+python run.py content                    # 抓正文
+python run.py retry-failed && python run.py content   # 可选：重试正文失败
+python run.py status
+python run.py export-jsonl
+python run.py export-account-summary
+```
 
 ---
 
@@ -307,15 +383,23 @@ python run.py export-account-summary
 
 - `pending`：未解析  
 - `ok`：已解析成功  
-- `failed`：解析失败（看库里的 `resolve_error`，或重跑 `resolve`）
+- `failed`：解析失败（**不会**被再次 `resolve` 自动捞起；先 `retry-resolve`）
 
 常见 `list` 取值：
 
 - `pending`：未拉历史列表  
-- `running`：正在拉  
-- `done`：该号历史列表已完成  
-- `failed`：拉列表失败  
+- `running`：正在拉（异常中断后，下次 `history` 会回收为可重试）  
+- `done`：该号历史列表已完成（默认不再扫；要增量用 `--refresh`）  
+- `failed`：拉列表失败（业务/接口错误等）  
+- `retry_wait`：多为历史**限流**后的可重试状态（再跑 `history`）  
 - `need_session`：登录凭证失效，需重新扫码并 `import-platform-from-download-api`
+
+`status` / `doctor` 还会给出**建议下一步**；也可用：
+
+```bash
+python run.py doctor
+python run.py errors
+```
 
 对应下一步：
 
@@ -323,8 +407,12 @@ python run.py export-account-summary
 # 还有 pending 的 resolve → 继续解析
 python run.py resolve
 
-# 已有 resolve=ok 但 list 仍是 pending → 继续拉历史
-python run.py history
+# resolve=failed → 先重置再解析
+python run.py retry-resolve
+python run.py resolve
+
+# 已有 resolve=ok 但 list 仍是 pending / failed / retry_wait → 继续拉历史
+python run.py --profile safe history
 
 # list=need_session → 先重新登录再 history
 python run.py import-platform-from-download-api
@@ -339,10 +427,10 @@ python run.py history
 |--------|------|--------|
 | `listed` | 已在列表里（有标题/链接等），**正文还没抓**或未成功 | `python run.py content` |
 | `ok` | 正文已抓成功（HTML + 纯文本都有） | 可分析 / `export-jsonl` |
-| `failed` | 正文抓取失败 | `python run.py retry-failed` 后再 `content` |
+| `failed` | 正文抓取失败（重试耗尽） | `python run.py retry-failed` 后再 `content` |
 | `deleted` | 原文已失效/删除 | 一般无需处理，仅作记录 |
 | `out_of_range` | 发布时间不在 `config.yaml` 的时间窗内 | 若需要可改时间窗后重跑 |
-| `retry_wait` | 临时失败，等待自动/稍后重试 | 再跑 `content` |
+| `retry_wait` | 临时失败/限流，等待冷却后重试 | 再跑 `content` |
 
 对上表示例的读法：
 
@@ -365,11 +453,12 @@ python run.py history
 ### 推荐操作顺序（对照状态）
 
 ```text
-import-list  →  账号出现在库里（resolve/list 多为 pending）
+import-list  →  账号出现在库里（已存在则 skipped）
 resolve      →  resolve 变为 ok
-history      →  list 变为 done，同时 listed 文章变多
+history      →  list 变为 done，listed 文章变多（默认跳过已 done）
 content      →  listed 逐步变成 ok
-export-jsonl →  默认导出 status=ok 的文章
+doctor/status→  看错误分类与建议动作
+export-*     →  导出文章明细与按账号汇总
 ```
 
 若你只想先看正文是否正常，可以：
@@ -383,13 +472,21 @@ python run.py status
 
 ---
 
-## 第 8 步：用 Python 分析
+## 第 8 步：用 Python 分析（论文最小路径）
+
+```bash
+# 先导出（可选）
+python run.py export-jsonl
+python run.py export-account-summary
+```
 
 ```python
 import sqlite3
 import pandas as pd
 
 conn = sqlite3.connect("data/wechat_archive.db")
+
+# 文章正文（默认分析对象）
 df = pd.read_sql_query(
     """
     SELECT a.account_name, ar.title, ar.publish_time, ar.content_text, ar.url
@@ -400,7 +497,27 @@ df = pd.read_sql_query(
     conn,
 )
 print(df.head())
+
+# 按账号汇总（也可直接读 export/account_summary.jsonl）
+summary = pd.read_sql_query(
+    """
+    SELECT
+      a.account_name,
+      COUNT(ar.id) AS articles_total,
+      SUM(CASE WHEN ar.status='ok' THEN 1 ELSE 0 END) AS articles_ok,
+      MIN(ar.publish_time) AS first_publish,
+      MAX(ar.publish_time) AS last_publish
+    FROM accounts a
+    LEFT JOIN articles ar ON ar.account_id = a.id
+    GROUP BY a.id
+    ORDER BY articles_ok DESC
+    """,
+    conn,
+)
+print(summary.head())
 ```
+
+也可用本地 API 全文检索（需先 `python run.py serve`，或直接查库里的 FTS）。
 
 ---
 
@@ -412,8 +529,10 @@ wechat-work/
 ├── wechat_crawler/              # clone 自 MichaelMu151/wechat_crawler
 │   ├── .venv/
 │   ├── config.yaml              # 默认指向 ../name_list.xlsx 与 ../wechat-download-api/.env
+│   ├── config.safe.yaml         # 频控后的安全档配置
 │   ├── run.py
-│   └── data/wechat_archive.db
+│   ├── data/wechat_archive.db
+│   └── export/
 └── wechat-download-api/         # clone 自 tmwgsicp/wechat-download-api
     ├── .env
     └── start.sh
@@ -428,9 +547,13 @@ wechat-work/
 | `../wechat-download-api-main` 找不到 | 旧文档路径；或没 clone 第二个仓库 | 按第 2 步 clone `wechat-download-api`（注意没有 `-main` 后缀） |
 | `env.example` / `start.sh` 找不到 | 人还不在 download-api 目录里 | 先 `cd .../wechat-download-api` |
 | 未配置公众平台凭证 | 还没扫码或没 import | 完成第 5、6 步 |
-| `need_session` | 登录过期 | 重新扫码并再次 import |
+| `need_session` / `auth:` | 登录过期 | 重新扫码并再次 import |
+| `rate_limited:` / `freq control` / `ret=200013` | 历史接口被频控 | **停跑**，等 1–2h+，再用 `python run.py --profile safe history` |
+| `history` 进度 `ok=0`、fail 猛涨、入库 0 | 连续频控空转（旧行为）或仍在硬跑 | 升级到本分支后应会熔断；仍见此象请 Ctrl+C 并换 `safe` |
+| `import-list` → `inserted:0, skipped:N` | 名单已导入过 | 正常；看 `status` / `doctor` |
+| `resolve` → `total:0` | 没有 pending | 正常；`failed` 需先 `retry-resolve` |
 | 名单读不到 | `name_list.xlsx` 位置不对 | 放在 `wechat-work/name_list.xlsx`（与两个仓库同级） |
-| 解析失败 | 昵称不完全一致 | 改成微信里显示的全名，或补上 `link` |
+| 解析失败 | 昵称不完全一致 | 改成微信里显示的全名，或补上 `link`；然后 `retry-resolve` |
 | `lsof -i :5000` 看到 `ControlCe` 占用，`bash start.sh` 报 `ERROR: [Errno 48] address already in use` | macOS 的“隔空播放接收器”（AirPlay Receiver）占用了 5000 端口，且系统进程会自动重启，无法靠 `kill` 彻底杀掉 | **方案一（推荐）**：系统设置 → 通用 → 隔空播放与接力 → 关闭「隔空播放接收器」，再重新运行 `bash start.sh`。<br>**方案二（备选）**：用 `PORT=5001 SITE_URL=http://127.0.0.1:5001 bash start.sh` 换端口启动，然后访问 `http://127.0.0.1:5001/login.html` |
 
 ---
@@ -452,5 +575,7 @@ bash scripts/setup_from_scratch.sh
 ## 说明
 
 - 本项目只抓标题、作者、时间、正文等学术存档字段，不抓阅读量/点赞。  
-- 请控制频率，仅用于学术研究与个人备份。  
-- `wechat-download-api` 有自己的开源许可证（AGPL）；本爬虫通过读取其登录后的 `.env` 或 HTTP 接口与之配合。
+- 请控制频率，仅用于学术研究与个人备份；**历史列表接口对频率极敏感**。  
+- `wechat-download-api` 有自己的开源许可证（AGPL）；本爬虫通过读取其登录后的 `.env` 或 HTTP 接口与之配合。  
+- 当前推荐跟踪分支：`cursor/wechat-archive-enhancements`（含熔断、doctor、进度条与安全档配置）。  
+- 吞吐自检（可选）：`python scripts/benchmark_scale.py --rows 10000 --content-mock 200`
