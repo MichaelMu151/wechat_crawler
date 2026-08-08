@@ -5,9 +5,13 @@ import resource
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
+from wechat_archive.config import PROFILES, apply_profile, load_config
 from wechat_archive.db import Database
 from wechat_archive.services.article_queries import article_page
+from wechat_archive.services import fetch_content as fetch_content_module
+from wechat_archive.services.fetch_content import fetch_pending_contents
 
 
 def timed(label: str, fn):
@@ -18,10 +22,70 @@ def timed(label: str, fn):
     return value
 
 
+def _mock_content_benchmark(rows: int, concurrency: int) -> dict[str, Any]:
+    """Mock HTTP content crawl to compare profile throughput (no network)."""
+    temporary = tempfile.TemporaryDirectory(prefix="wechat-content-bench-")
+    db = Database(Path(temporary.name) / "bench.db")
+    with db.connection() as conn:
+        account_id = conn.execute(
+            "INSERT INTO accounts (nickname_input) VALUES ('bench')"
+        ).lastrowid
+        for i in range(rows):
+            conn.execute(
+                """
+                INSERT INTO articles (account_id, url, status)
+                VALUES (?, ?, 'listed')
+                """,
+                (account_id, f"https://mp.weixin.qq.com/s/bench-{i}"),
+            )
+
+    class FastClient:
+        def get_text(self, url: str) -> tuple[str, str]:
+            html = (
+                '<meta property="og:title" content="t">'
+                '<div id="js_content"><p>body</p></div>'
+            )
+            return url, html
+
+        def close(self) -> None:
+            return None
+
+    cfg = apply_profile(load_config(), "balanced")
+    cfg["crawl"]["content_concurrency"] = concurrency
+    cfg["crawl"]["content_sleep_min"] = 0
+    cfg["crawl"]["content_sleep_max"] = 0
+    cfg["crawl"]["content_batch_size"] = 50
+    # patch sleep in caller via monkey-style: set sleeps to 0 already
+    started = time.perf_counter()
+    # bypass cooperative_sleep cost
+    original = fetch_content_module.cooperative_sleep
+    fetch_content_module.cooperative_sleep = lambda *_a, **_k: None
+    try:
+        stats = fetch_pending_contents(db, FastClient(), cfg, limit=rows)
+    finally:
+        fetch_content_module.cooperative_sleep = original
+        temporary.cleanup()
+    elapsed = max(0.001, time.perf_counter() - started)
+    per_hour = stats["ok"] / elapsed * 3600
+    return {
+        "ok": stats["ok"],
+        "elapsed_s": round(elapsed, 3),
+        "articles_per_hour_equiv": round(per_hour, 1),
+        "concurrency": concurrency,
+        "circuit_open": stats.get("circuit_open"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Synthetic SQLite scale benchmark")
     parser.add_argument("--rows", type=int, default=100_000)
     parser.add_argument("--database", type=Path)
+    parser.add_argument(
+        "--content-mock",
+        type=int,
+        default=0,
+        help="Also run mock content throughput bench with N articles",
+    )
     args = parser.parse_args()
 
     temporary = None
@@ -94,6 +158,11 @@ def main() -> None:
     print(f"database: {database_path}")
     print(f"database_size: {size_mb:.1f} MiB")
     print(f"peak_rss_platform_units: {peak_kib}")
+    print("profiles:", ", ".join(sorted(PROFILES)))
+    if args.content_mock:
+        for concurrency in (1, 2, 3):
+            result = _mock_content_benchmark(args.content_mock, concurrency)
+            print(f"content_mock_c{concurrency}: {result}")
     if temporary is not None:
         temporary.cleanup()
 

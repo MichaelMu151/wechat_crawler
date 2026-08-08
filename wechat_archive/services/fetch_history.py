@@ -17,6 +17,10 @@ from wechat_archive.platform_client import (
 from wechat_archive.services.job_control import JobCancelled, cooperative_sleep
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
+# Default queue: unfinished work only. Use refresh=True to also probe done accounts.
+_ACTIVE_LIST_STATUSES = ("pending", "running", "failed", "need_session", "retry_wait")
+_REFRESH_LIST_STATUSES = _ACTIVE_LIST_STATUSES + ("done",)
+
 
 class HistorySessionError(RuntimeError):
     """公众平台登录态不可用。"""
@@ -26,6 +30,28 @@ class HistoryRateLimited(RuntimeError):
     """公众平台限流。"""
 
 
+class HistoryCircuitOpen(RuntimeError):
+    """连续频控触发全局熔断，停止继续遍历账号。"""
+
+
+def _list_status_clause(refresh: bool) -> str:
+    statuses = _REFRESH_LIST_STATUSES if refresh else _ACTIVE_LIST_STATUSES
+    return ", ".join(f"'{s}'" for s in statuses)
+
+
+def _normalize_list_error(kind: str, message: str) -> str:
+    prefix = {
+        "rate_limited": "rate_limited:",
+        "auth": "auth:",
+        "api": "api:",
+        "interrupted": "interrupted:",
+    }.get(kind, "error:")
+    body = message.strip()
+    if body.startswith(prefix):
+        return body[:500]
+    return f"{prefix} {body}"[:500]
+
+
 def fetch_history_for_accounts(
     db: Database,
     client: HttpClient | None,
@@ -33,16 +59,30 @@ def fetch_history_for_accounts(
     limit_accounts: int | None = None,
     checkpoint: Callable[[], None] | None = None,
     progress: Callable[..., None] | None = None,
-) -> dict[str, int]:
+    refresh: bool = False,
+) -> dict[str, Any]:
     """对已解析 fakeid/biz 的账号拉取历史列表（公众平台 appmsgpublish）。"""
-    # client 参数保留兼容旧签名；平台模式使用独立 HTTP 会话
     _ = client
+    # CLI/history start: reclaim running left by killed processes (stale_minutes=0).
+    # serve/job path uses timed recovery separately.
+    reclaim_all = bool(cfg["crawl"].get("history_reclaim_running_on_start", True))
+    recovered = db.recover_stale_work(
+        stale_minutes=0
+        if reclaim_all
+        else int(cfg["crawl"].get("history_stale_running_minutes", 30))
+    )
+
     platform = build_history_client(cfg)
 
-    sleep_min = cfg["crawl"]["sleep_min"]
-    sleep_max = cfg["crawl"]["sleep_max"]
-    page_size = int(cfg["crawl"].get("history_page_size", 20))
-    page_size = min(max(page_size, 1), 100)
+    sleep_min = float(cfg["crawl"]["sleep_min"])
+    sleep_max = float(cfg["crawl"]["sleep_max"])
+    base_page_size = min(max(int(cfg["crawl"].get("history_page_size", 20)), 1), 100)
+    page_size = base_page_size
+    page_size_min = min(max(int(cfg["crawl"].get("history_page_size_min", 5)), 1), page_size)
+    page_size_max = min(
+        max(int(cfg["crawl"].get("history_page_size_max", base_page_size)), page_size),
+        100,
+    )
     start = datetime.strptime(cfg["crawl"]["start_date"], "%Y-%m-%d")
     end = datetime.strptime(cfg["crawl"]["end_date"], "%Y-%m-%d").replace(
         hour=23, minute=59, second=59
@@ -50,13 +90,21 @@ def fetch_history_for_accounts(
     start_ts = int(start.timestamp())
     end_ts = int(end.timestamp())
 
+    breaker_threshold = max(
+        1, int(cfg["crawl"].get("history_circuit_breaker_threshold", 3))
+    )
+    global_cooldown = max(
+        0, int(cfg["crawl"].get("history_global_cooldown", 3600))
+    )
+    status_sql = _list_status_clause(refresh)
+
     account_batch_size = max(1, int(cfg["crawl"].get("account_batch_size", 200)))
     total_row = db.fetchone(
-        """
+        f"""
         SELECT COUNT(*) AS count
         FROM accounts
         WHERE resolve_status='ok' AND biz IS NOT NULL
-          AND list_status IN ('pending', 'running', 'done', 'failed', 'need_session')
+          AND list_status IN ({status_sql})
         """
     )
     accounts_total = int(total_row["count"]) if total_row else 0
@@ -66,96 +114,154 @@ def fetch_history_for_accounts(
     account_ok = account_fail = articles_added = 0
     last_account_id = 0
     processed_accounts = 0
+    consecutive_rate_limits = 0
+    success_streak = 0
+    circuit_open = False
+    circuit_message = ""
+
     if progress:
+        mode = "含 done 增量刷新" if refresh else "跳过已完成"
         progress(
             0,
             accounts_total,
             phase="历史列表",
-            note=f"每页 {page_size} 条, 间隔 {sleep_min}-{sleep_max}s",
+            note=(
+                f"{mode} · 每页 {page_size} · 间隔 {sleep_min}-{sleep_max}s"
+                + (f" · 已回收 running {recovered.get('accounts', 0)}" if recovered.get("accounts") else "")
+            ),
         )
 
-    while processed_accounts < accounts_total:
-        remaining = accounts_total - processed_accounts
-        accounts = db.fetchall(
-            """
-            SELECT id, biz, account_name, nickname_input, list_status
-            FROM accounts
-            WHERE resolve_status='ok' AND biz IS NOT NULL
-              AND list_status IN ('pending', 'running', 'done', 'failed', 'need_session')
-              AND id > ?
-            ORDER BY id
-            LIMIT ?
-            """,
-            (last_account_id, min(account_batch_size, remaining)),
-        )
-        if not accounts:
-            break
-        for acc in accounts:
-            if checkpoint:
-                checkpoint()
-            account_id = acc["id"]
-            last_account_id = account_id
-            account_name = acc["account_name"] or acc["nickname_input"] or f"#{account_id}"
-            if progress:
-                progress(
-                    processed_accounts,
-                    accounts_total,
-                    phase="历史列表",
-                    account=account_name,
-                    account_done=0,
-                    account_total=None,
-                    ok=account_ok,
-                    failed=account_fail,
-                    note=f"累计入库 {articles_added}",
-                )
-            result = _fetch_history_for_account(
-                db=db,
-                platform=platform,
-                cfg=cfg,
-                acc=acc,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                page_size=page_size,
-                checkpoint=checkpoint,
-                progress=progress,
-                overall_current=processed_accounts,
-                overall_total=accounts_total,
-                overall_ok=account_ok,
-                overall_fail=account_fail,
-                overall_articles=articles_added,
+    try:
+        while processed_accounts < accounts_total:
+            remaining = accounts_total - processed_accounts
+            accounts = db.fetchall(
+                f"""
+                SELECT id, biz, account_name, nickname_input, list_status
+                FROM accounts
+                WHERE resolve_status='ok' AND biz IS NOT NULL
+                  AND list_status IN ({status_sql})
+                  AND id > ?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (last_account_id, min(account_batch_size, remaining)),
             )
-            processed_accounts += 1
-            account_ok += result["accounts_ok"]
-            account_fail += result["accounts_fail"]
-            articles_added += result["articles_upserted"]
-            if progress:
-                progress(
-                    processed_accounts,
-                    accounts_total,
-                    phase="历史列表",
-                    account=account_name,
-                    account_done=result["articles_upserted"],
-                    account_total=result["articles_upserted"] or None,
-                    ok=account_ok,
-                    failed=account_fail,
-                    note=f"累计入库 {articles_added}",
+            if not accounts:
+                break
+            for acc in accounts:
+                if checkpoint:
+                    checkpoint()
+                account_id = acc["id"]
+                last_account_id = account_id
+                account_name = (
+                    acc["account_name"] or acc["nickname_input"] or f"#{account_id}"
                 )
-            if result.get("rate_limited"):
-                cooperative_sleep(
-                    float(cfg["crawl"].get("history_rate_limit_cooldown", 300)),
-                    checkpoint,
+                if progress:
+                    progress(
+                        processed_accounts,
+                        accounts_total,
+                        phase="历史列表",
+                        account=account_name,
+                        account_done=0,
+                        account_total=None,
+                        ok=account_ok,
+                        failed=account_fail,
+                        note=f"累计入库 {articles_added} · 页大小 {page_size}",
+                    )
+                result = _fetch_history_for_account(
+                    db=db,
+                    platform=platform,
+                    cfg=cfg,
+                    acc=acc,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    page_size=page_size,
+                    checkpoint=checkpoint,
+                    progress=progress,
+                    overall_current=processed_accounts,
+                    overall_total=accounts_total,
+                    overall_ok=account_ok,
+                    overall_fail=account_fail,
+                    overall_articles=articles_added,
                 )
-            elif processed_accounts < accounts_total:
-                cooperative_sleep(
-                    random.uniform(sleep_min, sleep_max), checkpoint
-                )
+                processed_accounts += 1
+                account_ok += result["accounts_ok"]
+                account_fail += result["accounts_fail"]
+                articles_added += result["articles_upserted"]
 
-    return {
+                if result.get("rate_limited"):
+                    consecutive_rate_limits += 1
+                    success_streak = 0
+                    page_size = page_size_min
+                elif result["accounts_ok"]:
+                    consecutive_rate_limits = 0
+                    success_streak += 1
+                    if success_streak >= 5 and page_size < page_size_max:
+                        page_size = min(page_size_max, page_size + 5)
+
+                if progress:
+                    note = f"累计入库 {articles_added}"
+                    if consecutive_rate_limits:
+                        note += f" · 连续频控 {consecutive_rate_limits}/{breaker_threshold}"
+                    progress(
+                        processed_accounts,
+                        accounts_total,
+                        phase="历史列表",
+                        account=account_name,
+                        account_done=result["articles_upserted"],
+                        account_total=result["articles_upserted"] or None,
+                        ok=account_ok,
+                        failed=account_fail,
+                        note=note,
+                    )
+
+                if consecutive_rate_limits >= breaker_threshold:
+                    mins = max(1, global_cooldown // 60)
+                    circuit_message = (
+                        f"连续频控 {consecutive_rate_limits} 次，已熔断。"
+                        f"建议等待约 {mins} 分钟后再运行 history"
+                    )
+                    circuit_open = True
+                    if progress:
+                        progress(
+                            processed_accounts,
+                            accounts_total,
+                            phase="历史列表",
+                            note=circuit_message,
+                            ok=account_ok,
+                            failed=account_fail,
+                        )
+                    if global_cooldown > 0:
+                        cooperative_sleep(float(global_cooldown), checkpoint)
+                    raise HistoryCircuitOpen(circuit_message)
+
+                if result.get("rate_limited"):
+                    cooperative_sleep(
+                        float(cfg["crawl"].get("history_rate_limit_cooldown", 900)),
+                        checkpoint,
+                    )
+                elif processed_accounts < accounts_total:
+                    cooperative_sleep(
+                        random.uniform(sleep_min, sleep_max), checkpoint
+                    )
+    except HistoryCircuitOpen:
+        pass
+
+    out: dict[str, Any] = {
         "accounts_ok": account_ok,
         "accounts_fail": account_fail,
         "articles_upserted": articles_added,
         "accounts_total": processed_accounts,
+        "refresh": refresh,
+        "circuit_open": circuit_open,
+        "recovered_running": int(recovered.get("accounts") or 0),
+        "page_size_final": page_size,
     }
+    if circuit_open:
+        out["paused_rate_limit"] = True
+        out["circuit_message"] = circuit_message
+        out["suggested_wait_seconds"] = global_cooldown
+    return out
 
 
 def _fetch_history_for_account(
@@ -173,7 +279,7 @@ def _fetch_history_for_account(
     overall_ok: int = 0,
     overall_fail: int = 0,
     overall_articles: int = 0,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     account_id = acc["id"]
     fakeid = acc["biz"]
     account_name = acc["account_name"] or acc["nickname_input"] or f"#{account_id}"
@@ -198,7 +304,7 @@ def _fetch_history_for_account(
     previous_watermark = cp_row["newest_publish_ts"] if cp_row else None
     offset = (
         cp_row["history_offset"]
-        if cp_row and acc["list_status"] != "done"
+        if cp_row and acc["list_status"] not in ("done",)
         else 0
     )
     newest_seen = previous_watermark
@@ -206,7 +312,7 @@ def _fetch_history_for_account(
     articles_added = 0
     pages_done = 0
     rate_limit_retries = int(cfg["crawl"].get("history_rate_limit_retries", 2))
-    rate_limit_cooldown = float(cfg["crawl"].get("history_rate_limit_cooldown", 300))
+    rate_limit_cooldown = float(cfg["crawl"].get("history_rate_limit_cooldown", 900))
 
     try:
         while True:
@@ -311,7 +417,11 @@ def _fetch_history_for_account(
                         ),
                         updated_at=datetime('now','localtime')
                     """,
-                    (account_id, int(page.get("next_begin") or (offset + page_size)), newest_seen),
+                    (
+                        account_id,
+                        int(page.get("next_begin") or (offset + page_size)),
+                        newest_seen,
+                    ),
                 )
 
             if progress:
@@ -332,7 +442,6 @@ def _fetch_history_for_account(
 
             if reached_old or not can_continue or not rows:
                 break
-            # 按 publish 偏移推进，避免多图文展开导致跳页
             offset = int(page.get("next_begin") or (offset + page_size))
             cooperative_sleep(random.uniform(sleep_min, sleep_max), checkpoint)
 
@@ -361,10 +470,10 @@ def _fetch_history_for_account(
     except HistoryRateLimited as e:
         db.execute(
             """
-            UPDATE accounts SET list_status='failed', list_error=?,
+            UPDATE accounts SET list_status='retry_wait', list_error=?,
                 updated_at=datetime('now','localtime') WHERE id=?
             """,
-            (str(e)[:500], account_id),
+            (_normalize_list_error("rate_limited", str(e)), account_id),
         )
         return {
             "accounts_ok": 0,
@@ -380,7 +489,7 @@ def _fetch_history_for_account(
                     updated_at=datetime('now','localtime')
                 WHERE id=?
                 """,
-                (str(e)[:500], account_id),
+                (_normalize_list_error("auth", str(e)), account_id),
             )
         return {
             "accounts_ok": 0,
@@ -389,7 +498,12 @@ def _fetch_history_for_account(
         }
     except Exception as e:
         msg = str(e)
-        status = "need_session" if _is_session_error(msg) else "failed"
+        if _is_session_error(msg):
+            status = "need_session"
+            err = _normalize_list_error("auth", msg)
+        else:
+            status = "failed"
+            err = _normalize_list_error("api", msg)
         with db.connection() as conn:
             conn.execute(
                 """
@@ -397,7 +511,7 @@ def _fetch_history_for_account(
                     updated_at=datetime('now','localtime')
                 WHERE id=?
                 """,
-                (status, msg[:500], account_id),
+                (status, err, account_id),
             )
         return {
             "accounts_ok": 0,

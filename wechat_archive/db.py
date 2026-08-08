@@ -257,27 +257,53 @@ class Database:
             return conn.execute(sql, params).fetchone()
 
     def recover_stale_work(self, stale_minutes: int = 30) -> dict[str, int]:
-        """Make interrupted account and job work eligible for another attempt."""
+        """Make interrupted account and job work eligible for another attempt.
+
+        stale_minutes <= 0 means reclaim all running accounts (CLI history start).
+        """
         with self.connection() as conn:
-            accounts = conn.execute(
-                """
-                UPDATE accounts
-                SET list_status='failed', list_error='interrupted; safe to retry',
-                    updated_at=datetime('now','localtime')
-                WHERE list_status='running'
-                """
-            ).rowcount
-            jobs = conn.execute(
-                """
-                UPDATE jobs
-                SET status='failed', error='worker heartbeat expired',
-                    finished_at=datetime('now','localtime')
-                WHERE status='running'
-                  AND COALESCE(heartbeat_at, started_at) <
-                      datetime('now', ?, 'localtime')
-                """,
-                (f"-{stale_minutes} minutes",),
-            ).rowcount
+            if stale_minutes <= 0:
+                accounts = conn.execute(
+                    """
+                    UPDATE accounts
+                    SET list_status='failed',
+                        list_error='interrupted: safe to retry',
+                        updated_at=datetime('now','localtime')
+                    WHERE list_status='running'
+                    """
+                ).rowcount
+                jobs = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status='failed', error='worker heartbeat expired',
+                        finished_at=datetime('now','localtime')
+                    WHERE status='running'
+                    """
+                ).rowcount
+            else:
+                stale = f"-{stale_minutes} minutes"
+                accounts = conn.execute(
+                    """
+                    UPDATE accounts
+                    SET list_status='failed',
+                        list_error='interrupted: safe to retry',
+                        updated_at=datetime('now','localtime')
+                    WHERE list_status='running'
+                      AND updated_at < datetime('now', ?, 'localtime')
+                    """,
+                    (stale,),
+                ).rowcount
+                jobs = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status='failed', error='worker heartbeat expired',
+                        finished_at=datetime('now','localtime')
+                    WHERE status='running'
+                      AND COALESCE(heartbeat_at, started_at) <
+                          datetime('now', ?, 'localtime')
+                    """,
+                    (stale,),
+                ).rowcount
         return {"accounts": accounts, "jobs": jobs}
 
     def recover_interrupted_jobs(self) -> dict[str, int]:
@@ -299,7 +325,7 @@ class Database:
             accounts = conn.execute(
                 """
                 UPDATE accounts
-                SET list_status='failed', list_error='interrupted; safe to retry',
+                SET list_status='failed', list_error='interrupted: safe to retry',
                     updated_at=datetime('now','localtime')
                 WHERE list_status='running'
                 """

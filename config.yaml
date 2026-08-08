@@ -4,6 +4,8 @@
 #     name_list.xlsx
 #     wechat_crawler/          ← 本项目
 #     wechat-download-api/     ← 另一个 GitHub 仓库
+#
+# 可用 CLI --profile safe|balanced|fast 覆盖 crawl 节奏（见 wechat_archive/config.py）
 
 paths:
   # 名单默认放在上一级工作目录（与两个仓库同级）
@@ -24,25 +26,30 @@ platform:
 crawl:
   # 历史时间窗（含边界）
   start_date: "2018-01-01"
-  # 系统当前为 2026；样例文也可能是当年发文
   end_date: "2026-12-31"
-  # 历史列表请求间隔（秒）；平台接口更敏感，保持偏保守
-  sleep_min: 3
-  sleep_max: 6
-  # 历史列表每页条数（appmsgpublish 最大 100；40 可减少翻页次数）
-  history_page_size: 40
-  # 账号与正文都按有界批次读取，避免十万/百万行一次性进入内存
+  # 历史列表请求间隔（秒）；平台接口敏感，默认偏安全
+  sleep_min: 10
+  sleep_max: 20
+  # 历史列表每页条数（动态升降的中枢；遇限流会降到 min）
+  history_page_size: 15
+  history_page_size_min: 5
+  history_page_size_max: 40
+  # 账号与正文都按有界批次读取
   account_batch_size: 200
   content_batch_size: 500
-  # 正文抓取：独立间隔 + 有限并发（目标约 2× 吞吐，遇限流会自动降速/冷却）
+  # 正文抓取：独立间隔 + 有限并发
   content_sleep_min: 1.5
   content_sleep_max: 3.5
   content_concurrency: 2
-  # 正文失败最多重试次数
   content_max_retries: 3
-  # 微信返回访问频繁时使用长冷却，不快速轮换所有会话
+  content_circuit_breaker_threshold: 5
+  # 微信返回访问频繁时：单账号冷却 + 连续失败熔断
   history_rate_limit_retries: 2
-  history_rate_limit_cooldown: 300
+  history_rate_limit_cooldown: 900
+  history_circuit_breaker_threshold: 3
+  history_global_cooldown: 3600
+  history_reclaim_running_on_start: true
+  history_stale_running_minutes: 30
   content_rate_limit_cooldown: 600
   # User-Agent：模拟微信内置浏览器
   user_agent: >-
@@ -56,20 +63,16 @@ http:
   backoff_factor: 1.0
   pool_connections: 8
   pool_maxsize: 16
-  # 禁用系统代理，避免本机抓包软件干扰
   trust_env: false
-  # 可选：http://user:pass@host:port 或 socks5://host:port
   proxy:
 
 jobs:
-  # 历史列表接口对并发敏感，默认只运行一个持久任务
   workers: 1
   heartbeat_interval: 10
   progress_interval: 5
   event_retention_days: 30
 
 database:
-  # SQLite 单机大库的保守参数；cache_size_kib 使用负数表示 KiB
   synchronous: NORMAL
   cache_size_kib: -65536
   mmap_size: 268435456

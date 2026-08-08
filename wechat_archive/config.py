@@ -8,8 +8,89 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "config.yaml"
 
+PROFILES: dict[str, dict[str, Any]] = {
+    "safe": {
+        "crawl": {
+            "sleep_min": 15,
+            "sleep_max": 30,
+            "history_page_size": 10,
+            "history_page_size_min": 5,
+            "history_page_size_max": 20,
+            "history_rate_limit_retries": 3,
+            "history_rate_limit_cooldown": 900,
+            "history_circuit_breaker_threshold": 2,
+            "history_global_cooldown": 7200,
+            "content_sleep_min": 2.5,
+            "content_sleep_max": 5.0,
+            "content_concurrency": 1,
+            "content_rate_limit_cooldown": 900,
+            "content_circuit_breaker_threshold": 3,
+        }
+    },
+    "balanced": {
+        "crawl": {
+            "sleep_min": 10,
+            "sleep_max": 20,
+            "history_page_size": 15,
+            "history_page_size_min": 5,
+            "history_page_size_max": 40,
+            "history_rate_limit_retries": 2,
+            "history_rate_limit_cooldown": 900,
+            "history_circuit_breaker_threshold": 3,
+            "history_global_cooldown": 3600,
+            "content_sleep_min": 1.5,
+            "content_sleep_max": 3.5,
+            "content_concurrency": 2,
+            "content_rate_limit_cooldown": 600,
+            "content_circuit_breaker_threshold": 5,
+        }
+    },
+    "fast": {
+        "crawl": {
+            # History stays conservative; only content is more aggressive.
+            "sleep_min": 10,
+            "sleep_max": 20,
+            "history_page_size": 15,
+            "history_page_size_min": 5,
+            "history_page_size_max": 40,
+            "history_rate_limit_retries": 2,
+            "history_rate_limit_cooldown": 900,
+            "history_circuit_breaker_threshold": 3,
+            "history_global_cooldown": 3600,
+            "content_sleep_min": 1.0,
+            "content_sleep_max": 2.5,
+            "content_concurrency": 3,
+            "content_rate_limit_cooldown": 480,
+            "content_circuit_breaker_threshold": 5,
+        }
+    },
+}
 
-def load_config(path: Path | str | None = None) -> dict[str, Any]:
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def apply_profile(cfg: dict[str, Any], profile: str | None) -> dict[str, Any]:
+    if not profile:
+        return cfg
+    key = profile.strip().lower()
+    if key not in PROFILES:
+        raise ValueError(
+            f"未知 profile: {profile}；可选: {', '.join(sorted(PROFILES))}"
+        )
+    return _deep_merge(cfg, PROFILES[key])
+
+
+def load_config(
+    path: Path | str | None = None, profile: str | None = None
+) -> dict[str, Any]:
     cfg_path = Path(path) if path else DEFAULT_CONFIG
     with cfg_path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -35,6 +116,10 @@ def load_config(path: Path | str | None = None) -> dict[str, Any]:
     env_path = platform.get("download_api_env")
     if env_path and not Path(env_path).is_absolute():
         platform["download_api_env"] = str((ROOT / env_path).resolve())
+
+    if profile:
+        cfg = apply_profile(cfg, profile)
+    cfg["_profile"] = profile or "default"
     return cfg
 
 

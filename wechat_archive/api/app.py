@@ -17,6 +17,12 @@ from wechat_archive.config import ensure_dirs, load_config
 from wechat_archive.db import Database
 from wechat_archive.services.article_queries import article_page
 from wechat_archive.services.jobs import JobRunner
+from wechat_archive.services.ops import (
+    aggregate_errors,
+    build_doctor_report,
+    reset_failed_resolves,
+    suggest_next_actions,
+)
 from wechat_archive.platform_client import load_platform_credentials
 from wechat_archive.url_utils import article_sn, normalize_article_url
 
@@ -52,6 +58,11 @@ app.add_middleware(
 
 class JobCreate(BaseModel):
     stage: Literal["import", "resolve", "history", "content"]
+    limit: int | None = Field(default=None, ge=1, le=100_000)
+    refresh: bool = False
+
+
+class RetryResolveBody(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=100_000)
 
 
@@ -97,6 +108,7 @@ def stats() -> dict[str, Any]:
     )
     creds = load_platform_credentials(cfg)
     backend = (cfg.get("platform") or {}).get("backend", "platform")
+    errors = aggregate_errors(db, limit=10)
     return {
         "accounts": [dict(row) for row in account_rows],
         "articles": {row["status"]: row["count"] for row in article_rows},
@@ -104,7 +116,25 @@ def stats() -> dict[str, Any]:
         "platform_backend": backend,
         "platform_configured": bool(creds) or backend == "download_api",
         "platform_source": creds.source if creds else None,
+        "errors": errors,
+        "next_actions": suggest_next_actions(db, cfg),
     }
+
+
+@app.get("/api/v1/doctor")
+def doctor() -> dict[str, Any]:
+    return build_doctor_report(db, cfg)
+
+
+@app.get("/api/v1/errors")
+def errors(limit: int = Query(20, ge=1, le=100)) -> dict[str, Any]:
+    return aggregate_errors(db, limit=limit)
+
+
+@app.post("/api/v1/retry-resolve", status_code=200)
+def retry_resolve(body: RetryResolveBody | None = None) -> dict[str, int]:
+    limit = body.limit if body else None
+    return {"reset": reset_failed_resolves(db, limit=limit)}
 
 
 @app.get("/api/v1/accounts")
@@ -232,7 +262,11 @@ def jobs(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
 
 @app.post("/api/v1/jobs", status_code=202)
 def create_job(body: JobCreate) -> dict[str, int]:
-    return {"id": runner.create(body.stage, {"limit": body.limit})}
+    return {
+        "id": runner.create(
+            body.stage, {"limit": body.limit, "refresh": body.refresh}
+        )
+    }
 
 
 @app.post("/api/v1/jobs/{job_id}/cancel", status_code=202)

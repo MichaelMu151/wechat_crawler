@@ -165,3 +165,41 @@ def test_adaptive_delay_speeds_up_after_success_streak() -> None:
     assert delay.current < before
     delay.on_rate_limit()
     assert delay.current > before
+
+
+def test_content_circuit_breaker_stops_after_consecutive_rate_limits(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(
+        fetch_content_module, "cooperative_sleep", lambda *_args, **_kw: None
+    )
+    db = Database(tmp_path / "archive.db")
+    with db.connection() as conn:
+        account_id = conn.execute(
+            "INSERT INTO accounts (nickname_input) VALUES ('sample')"
+        ).lastrowid
+        for index in range(6):
+            conn.execute(
+                """
+                INSERT INTO articles (account_id, url, status)
+                VALUES (?, ?, 'listed')
+                """,
+                (account_id, f"https://mp.weixin.qq.com/s/rl{index}"),
+            )
+
+    result = fetch_pending_contents(
+        db,
+        RateLimitedClient(),
+        _base_crawl(
+            content_batch_size=2,
+            content_concurrency=1,
+            content_rate_limit_cooldown=1,
+            content_circuit_breaker_threshold=3,
+        ),
+    )
+    assert result["circuit_open"] is True
+    assert result["failed"] == 3
+    pending = db.fetchone(
+        "SELECT COUNT(*) AS c FROM articles WHERE status='listed'"
+    )
+    assert int(pending["c"]) == 3

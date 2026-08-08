@@ -78,6 +78,11 @@ def fetch_pending_contents(
         else configured_batch
     )
     rate_limit_cooldown = max(1, int(crawl.get("content_rate_limit_cooldown", 600)))
+    breaker_threshold = max(
+        1, int(crawl.get("content_circuit_breaker_threshold", 5))
+    )
+    consecutive_rate_limits = 0
+    circuit_open = False
 
     with db.connection() as conn:
         skipped = conn.execute(
@@ -206,6 +211,7 @@ def fetch_pending_contents(
             outcomes.sort(key=lambda x: (x["account_id"], x["article_id"]))
 
         hit_rate_limit = False
+        batch_rate_limits = 0
         for outcome in outcomes:
             if checkpoint:
                 checkpoint()
@@ -219,6 +225,8 @@ def fetch_pending_contents(
 
             if outcome["rate_limited"]:
                 hit_rate_limit = True
+                batch_rate_limits += 1
+                consecutive_rate_limits += 1
                 retry_count = int(outcome["retry_count"]) + 1
                 db.execute(
                     """
@@ -246,8 +254,14 @@ def fetch_pending_contents(
                         ok=ok,
                         failed=failed,
                         deleted=deleted,
-                        note=f"触发限流，将冷却 {rate_limit_cooldown}s",
+                        note=(
+                            f"触发限流 ({consecutive_rate_limits}/{breaker_threshold})，"
+                            f"将冷却 {rate_limit_cooldown}s"
+                        ),
                     )
+                if consecutive_rate_limits >= breaker_threshold:
+                    circuit_open = True
+                    break
                 continue
 
             try:
@@ -345,6 +359,25 @@ def fetch_pending_contents(
                     deleted=deleted,
                 )
 
+        if batch_rate_limits == 0:
+            consecutive_rate_limits = 0
+        if circuit_open:
+            note = (
+                f"正文连续限流 {consecutive_rate_limits} 次，已熔断暂停。"
+                f"建议稍后重跑 content"
+            )
+            if progress:
+                progress(
+                    processed,
+                    target_total,
+                    phase="正文",
+                    note=note,
+                    ok=ok,
+                    failed=failed,
+                    deleted=deleted,
+                )
+            cooperative_sleep(rate_limit_cooldown, checkpoint, slice_seconds=5.0)
+            break
         if hit_rate_limit and processed < target_total:
             if progress:
                 progress(
@@ -366,6 +399,7 @@ def fetch_pending_contents(
         "total": processed + skipped,
         "concurrency": concurrency,
         "content_sleep": [sleep_min, sleep_max],
+        "circuit_open": circuit_open,
     }
 
 

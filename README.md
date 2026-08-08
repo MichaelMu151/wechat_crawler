@@ -225,19 +225,39 @@ python run.py export-jsonl
 
 运行 `resolve` / `history` / `content` 时，终端会显示**总进度条 + 当前账号进度**（完成数、速度、ETA、ok/fail）。
 
-### 提速相关配置（`config.yaml` → `crawl`）
+### 可持续爬取与提速（`config.yaml` / `--profile`）
 
-正文阶段通常最耗时。默认已做保守提速（目标约 **2×** 吞吐，遇限流会自动降速并冷却）：
+历史列表接口极易 `freq control`（ret=200013）。默认策略：
+
+- **`history` 默认跳过 `done`**，加 `--refresh` 才增量刷新已完成账号
+- **连续频控熔断**：达到阈值后停止遍历，避免空转十小时
+- **`list_error` 前缀**：`rate_limited:` / `auth:` / `api:` / `interrupted:`
+- **节奏档位**：`python run.py --profile safe|balanced|fast …`（或 `config.safe.yaml`）
 
 | 项 | 默认 | 说明 |
 |----|------|------|
-| `content_concurrency` | `2` | 同时抓几篇正文；不要盲目调到很大 |
-| `content_sleep_min` / `content_sleep_max` | `1.5` / `3.5` | 正文请求间隔（秒），与历史列表的 `sleep_*` 分开 |
-| `content_rate_limit_cooldown` | `600` | 触发「访问频繁」后的冷却秒数 |
-| `history_page_size` | `40` | 历史列表每页条数（最大 100） |
-| `sleep_min` / `sleep_max` | `3` / `6` | **仅**历史列表/解析的间隔 |
+| `sleep_min` / `sleep_max` | `10` / `20` | 历史列表/解析间隔（秒） |
+| `history_page_size` | `15` | 历史每页条数；成功会升、限流会降 |
+| `history_circuit_breaker_threshold` | `3` | 连续账号频控后熔断 |
+| `history_global_cooldown` | `3600` | 熔断后建议等待秒数 |
+| `content_concurrency` | `2` | 正文并发；勿盲目加大 |
+| `content_sleep_min` / `max` | `1.5` / `3.5` | 正文间隔 |
+| `content_circuit_breaker_threshold` | `5` | 正文连续限流后暂停 |
 
-若频繁出现 `retry_wait` / `rate_limited`：先把 `content_concurrency` 改为 `1`，并把 `content_sleep_*` 略调大。
+运维命令：
+
+```bash
+python run.py doctor              # 凭证/错误/建议下一步
+python run.py errors              # 错误聚合
+python run.py status              # 漏斗 + 建议动作
+python run.py status --json
+python run.py --profile safe history
+python run.py history --refresh   # 含 done 增量
+python run.py retry-resolve       # 重置 resolve=failed
+python run.py export-account-summary
+```
+
+若大量 `rate_limited`：先停跑，用 `--profile safe` 再跑 `history`。
 
 ---
 

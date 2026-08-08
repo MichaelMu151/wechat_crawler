@@ -1,0 +1,62 @@
+# 安全档：频控后或大批量 history 前使用
+#   python run.py --config config.safe.yaml history
+# 或：
+#   python run.py --profile safe history
+
+paths:
+  name_list: ../name_list.xlsx
+  database: data/wechat_archive.db
+  sessions_dir: sessions
+  platform_credentials: sessions/platform_credentials.yaml
+
+platform:
+  backend: platform
+  download_api_base_url: http://127.0.0.1:5000
+  download_api_env: ../wechat-download-api/.env
+
+crawl:
+  start_date: "2018-01-01"
+  end_date: "2026-12-31"
+  sleep_min: 15
+  sleep_max: 30
+  history_page_size: 10
+  history_page_size_min: 5
+  history_page_size_max: 20
+  account_batch_size: 200
+  content_batch_size: 200
+  content_sleep_min: 2.5
+  content_sleep_max: 5.0
+  content_concurrency: 1
+  content_max_retries: 3
+  content_circuit_breaker_threshold: 3
+  history_rate_limit_retries: 3
+  history_rate_limit_cooldown: 900
+  history_circuit_breaker_threshold: 2
+  history_global_cooldown: 7200
+  history_reclaim_running_on_start: true
+  content_rate_limit_cooldown: 900
+  user_agent: >-
+    Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)
+    AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148
+    MicroMessenger/8.0.40(0x18002831) NetType/WIFI Language/zh_CN
+
+http:
+  timeout: 30
+  max_retries: 3
+  backoff_factor: 1.0
+  pool_connections: 4
+  pool_maxsize: 8
+  trust_env: false
+  proxy:
+
+jobs:
+  workers: 1
+  heartbeat_interval: 10
+  progress_interval: 5
+  event_retention_days: 30
+
+database:
+  synchronous: NORMAL
+  cache_size_kib: -65536
+  mmap_size: 268435456
+  wal_autocheckpoint: 1000

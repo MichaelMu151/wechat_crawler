@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 from wechat_archive.db import Database
+from wechat_archive.platform_client import PlatformRateLimited
 from wechat_archive.services import fetch_history as fetch_history_module
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 
@@ -13,7 +14,13 @@ class FakePlatform:
     def list_articles(self, fakeid: str, begin: int = 0, count: int = 20, keyword=None):
         self.calls.append((fakeid, begin, count))
         if begin > 0:
-            return {"articles": [], "total": 1, "begin": begin, "count": 0, "can_continue": False}
+            return {
+                "articles": [],
+                "total": 1,
+                "begin": begin,
+                "count": 0,
+                "can_continue": False,
+            }
         return {
             "articles": [
                 {
@@ -39,6 +46,28 @@ class FakePlatform:
         }
 
 
+def _cfg(tmp_path: Path, **crawl_extra: Any) -> dict[str, Any]:
+    crawl = {
+        "sleep_min": 0,
+        "sleep_max": 0,
+        "history_page_size": 20,
+        "account_batch_size": 50,
+        "start_date": "2018-01-01",
+        "end_date": "2026-12-31",
+        "history_rate_limit_retries": 0,
+        "history_rate_limit_cooldown": 0,
+        "history_circuit_breaker_threshold": 3,
+        "history_global_cooldown": 0,
+        "history_reclaim_running_on_start": True,
+    }
+    crawl.update(crawl_extra)
+    return {
+        "paths": {"sessions_dir": str(tmp_path / "sessions")},
+        "platform": {"backend": "platform"},
+        "crawl": crawl,
+    }
+
+
 def test_fetch_history_uses_platform_client(tmp_path: Path, monkeypatch: Any) -> None:
     db = Database(tmp_path / "archive.db")
     with db.connection() as conn:
@@ -51,25 +80,9 @@ def test_fetch_history_uses_platform_client(tmp_path: Path, monkeypatch: Any) ->
 
     fake = FakePlatform()
     monkeypatch.setattr(
-        fetch_history_module,
-        "build_history_client",
-        lambda _cfg: fake,
+        fetch_history_module, "build_history_client", lambda _cfg: fake
     )
-    cfg = {
-        "paths": {"sessions_dir": str(tmp_path / "sessions")},
-        "platform": {"backend": "platform"},
-        "crawl": {
-            "sleep_min": 0,
-            "sleep_max": 0,
-            "history_page_size": 20,
-            "account_batch_size": 50,
-            "start_date": "2018-01-01",
-            "end_date": "2026-12-31",
-            "history_rate_limit_retries": 1,
-            "history_rate_limit_cooldown": 0,
-        },
-    }
-    stats = fetch_history_for_accounts(db, None, cfg)
+    stats = fetch_history_for_accounts(db, None, _cfg(tmp_path))
     assert stats["accounts_ok"] == 1
     assert stats["articles_upserted"] >= 1
     assert fake.calls and fake.calls[0][0] == "MzFakeId=="
@@ -100,28 +113,97 @@ def test_platform_auth_error_marks_need_session(
             raise PlatformAuthError("login expired")
 
     monkeypatch.setattr(
-        fetch_history_module,
-        "build_history_client",
-        lambda _cfg: BadPlatform(),
+        fetch_history_module, "build_history_client", lambda _cfg: BadPlatform()
     )
-    cfg = {
-        "paths": {"sessions_dir": str(tmp_path / "sessions")},
-        "platform": {"backend": "platform"},
-        "crawl": {
-            "sleep_min": 0,
-            "sleep_max": 0,
-            "history_page_size": 20,
-            "account_batch_size": 50,
-            "start_date": "2018-01-01",
-            "end_date": "2026-12-31",
-            "history_rate_limit_retries": 0,
-            "history_rate_limit_cooldown": 0,
-        },
-    }
-    stats = fetch_history_for_accounts(db, None, cfg)
+    stats = fetch_history_for_accounts(db, None, _cfg(tmp_path))
     assert stats["accounts_fail"] == 1
     account = db.fetchone("SELECT list_status, list_error FROM accounts WHERE id=1")
     assert account["list_status"] == "need_session"
-    assert "expired" in (account["list_error"] or "").lower() or "登录" in (
-        account["list_error"] or ""
+    assert str(account["list_error"]).startswith("auth:")
+
+
+def test_history_skips_done_unless_refresh(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    db = Database(tmp_path / "archive.db")
+    with db.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO accounts (nickname_input, biz, resolve_status, list_status)
+            VALUES ('done-acc', 'MzDone==', 'ok', 'done')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO accounts (nickname_input, biz, resolve_status, list_status)
+            VALUES ('pending-acc', 'MzPend==', 'ok', 'pending')
+            """
+        )
+    fake = FakePlatform()
+    monkeypatch.setattr(
+        fetch_history_module, "build_history_client", lambda _cfg: fake
     )
+    stats = fetch_history_for_accounts(db, None, _cfg(tmp_path), refresh=False)
+    assert stats["accounts_total"] == 1
+    assert all(call[0] == "MzPend==" for call in fake.calls)
+
+    fake2 = FakePlatform()
+    monkeypatch.setattr(
+        fetch_history_module, "build_history_client", lambda _cfg: fake2
+    )
+    # pending already done from previous run; refresh should hit done account(s)
+    with db.connection() as conn:
+        conn.execute("UPDATE accounts SET list_status='done'")
+    stats2 = fetch_history_for_accounts(db, None, _cfg(tmp_path), refresh=True)
+    assert stats2["accounts_total"] == 2
+    assert {c[0] for c in fake2.calls} == {"MzDone==", "MzPend=="}
+
+
+def test_history_circuit_breaker_stops_after_consecutive_rate_limits(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    db = Database(tmp_path / "archive.db")
+    with db.connection() as conn:
+        for i in range(5):
+            conn.execute(
+                """
+                INSERT INTO accounts (nickname_input, biz, resolve_status, list_status)
+                VALUES (?, ?, 'ok', 'pending')
+                """,
+                (f"acc-{i}", f"Mz{i}=="),
+            )
+
+    class RateLimitPlatform:
+        def list_articles(self, **_kwargs):
+            raise PlatformRateLimited("appmsgpublish failed: ret=200013 msg=freq control")
+
+    monkeypatch.setattr(
+        fetch_history_module,
+        "build_history_client",
+        lambda _cfg: RateLimitPlatform(),
+    )
+    monkeypatch.setattr(
+        fetch_history_module, "cooperative_sleep", lambda *_a, **_k: None
+    )
+    stats = fetch_history_for_accounts(
+        db,
+        None,
+        _cfg(
+            tmp_path,
+            history_circuit_breaker_threshold=3,
+            history_global_cooldown=0,
+            history_rate_limit_retries=0,
+        ),
+    )
+    assert stats["circuit_open"] is True
+    assert stats["accounts_fail"] == 3
+    assert stats["accounts_total"] == 3
+    remaining = db.fetchone(
+        "SELECT COUNT(*) AS c FROM accounts WHERE list_status='pending'"
+    )
+    assert int(remaining["c"]) == 2
+    failed = db.fetchone(
+        "SELECT list_status, list_error FROM accounts WHERE list_status='retry_wait' LIMIT 1"
+    )
+    assert failed is not None
+    assert str(failed["list_error"]).startswith("rate_limited:")

@@ -8,7 +8,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from wechat_archive.config import ensure_dirs, load_config
+from wechat_archive.config import PROFILES, ensure_dirs, load_config
 from wechat_archive.db import Database
 from wechat_archive.http_client import HttpClient
 from wechat_archive.platform_client import (
@@ -24,6 +24,12 @@ from wechat_archive.progress_ui import CrawlProgress
 from wechat_archive.services.fetch_content import fetch_pending_contents
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 from wechat_archive.services.import_accounts import import_name_list
+from wechat_archive.services.ops import (
+    account_summary_rows,
+    aggregate_errors,
+    build_doctor_report,
+    reset_failed_resolves,
+)
 from wechat_archive.services.resolve_accounts import resolve_pending_accounts
 from wechat_archive.services.session_import import (
     SessionImportError,
@@ -46,13 +52,26 @@ def _progress_log_path(cfg: dict, name: str) -> Path:
 
 @click.group()
 @click.option("--config", "config_path", default=None, help="配置文件路径")
+@click.option(
+    "--profile",
+    type=click.Choice(sorted(PROFILES.keys())),
+    default=None,
+    help="节奏档位：safe / balanced / fast（覆盖 crawl 间隔与熔断参数）",
+)
 @click.pass_context
-def cli(ctx: click.Context, config_path: str | None) -> None:
+def cli(
+    ctx: click.Context, config_path: str | None, profile: str | None
+) -> None:
     """微信公众号学术存档爬虫（试点版）"""
-    cfg = load_config(config_path)
+    try:
+        cfg = load_config(config_path, profile=profile)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     ensure_dirs(cfg)
     ctx.ensure_object(dict)
     ctx.obj["cfg"] = cfg
+    if profile:
+        console.print(f"[dim]profile={profile}[/dim]")
 
 
 @cli.command("init-db")
@@ -223,8 +242,13 @@ def platform_status_cmd(ctx: click.Context) -> None:
 
 @cli.command("history")
 @click.option("--limit", default=None, type=int, help="最多处理多少个账号")
+@click.option(
+    "--refresh",
+    is_flag=True,
+    help="同时增量刷新已完成(done)账号；默认跳过 done 以节省配额",
+)
 @click.pass_context
-def history_cmd(ctx: click.Context, limit: int | None) -> None:
+def history_cmd(ctx: click.Context, limit: int | None, refresh: bool) -> None:
     """拉取历史发文列表（需要公众平台凭证，不再依赖 getmsg 抓包）。"""
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
@@ -248,9 +272,18 @@ def history_cmd(ctx: click.Context, limit: int | None) -> None:
         console=console,
     ) as prog:
         stats = fetch_history_for_accounts(
-            db, client, cfg, limit_accounts=limit, progress=prog.callback
+            db,
+            client,
+            cfg,
+            limit_accounts=limit,
+            progress=prog.callback,
+            refresh=refresh,
         )
     console.print(f"历史列表完成: {stats}")
+    if stats.get("circuit_open"):
+        console.print(
+            f"[yellow]{stats.get('circuit_message') or '已因频控熔断暂停'}[/yellow]"
+        )
 
 
 @cli.command("import-session-har")
@@ -338,55 +371,155 @@ def content_cmd(ctx: click.Context, limit: int | None) -> None:
 
 
 @cli.command("status")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON（便于周报/脚本）")
 @click.pass_context
-def status_cmd(ctx: click.Context) -> None:
-    """查看进度概览。"""
+def status_cmd(ctx: click.Context, as_json: bool = False) -> None:
+    """查看进度概览（账号漏斗 + 文章漏斗 + 建议动作）。"""
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
+    report = build_doctor_report(db, cfg)
+    if as_json:
+        console.print_json(data=report)
+        return
 
     table = Table(title="账号状态")
     table.add_column("resolve")
     table.add_column("list")
     table.add_column("count", justify="right")
-    for row in db.fetchall(
-        """
-        SELECT resolve_status, list_status, COUNT(*) AS c
-        FROM accounts
-        GROUP BY resolve_status, list_status
-        ORDER BY resolve_status, list_status
-        """
-    ):
-        table.add_row(row["resolve_status"], row["list_status"], str(row["c"]))
+    for row in report["accounts"]:
+        table.add_row(row["resolve_status"], row["list_status"], str(row["count"]))
     console.print(table)
 
     table2 = Table(title="文章状态")
     table2.add_column("status")
     table2.add_column("count", justify="right")
-    for row in db.fetchall(
-        "SELECT status, COUNT(*) AS c FROM articles GROUP BY status ORDER BY status"
-    ):
-        table2.add_row(row["status"], str(row["c"]))
+    for status, count in sorted(report["articles"].items()):
+        table2.add_row(status, str(count))
     console.print(table2)
 
-    backend = (cfg.get("platform") or {}).get("backend", "platform")
-    creds = load_platform_credentials(cfg)
-    if backend == "download_api":
+    kinds = report["errors"].get("list_by_kind") or {}
+    if kinds:
+        console.print(
+            "历史错误分类: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(kinds.items(), key=lambda x: -x[1]))
+        )
+
+    platform = report["platform"]
+    if platform.get("backend") == "download_api":
         console.print(
             f"历史后端: download_api "
             f"({(cfg.get('platform') or {}).get('download_api_base_url')})"
         )
-    elif creds:
-        import time
-
+    elif platform.get("configured"):
         remain = ""
-        if creds.expire_time_ms:
-            remain = (
-                f"，预计剩余 {(creds.expire_time_ms / 1000 - time.time()) / 3600:.1f}h"
-            )
-        console.print(f"公众平台凭证: 已配置（来源 {creds.source}{remain}）")
+        if platform.get("remain_hours") is not None:
+            remain = f"，预计剩余 {platform['remain_hours']:.1f}h"
+        console.print(
+            f"公众平台凭证: 已配置（来源 {platform.get('source')}{remain}）"
+        )
     else:
         console.print("公众平台凭证: [yellow]未配置[/yellow]")
-    console.print(f"数据库: {cfg['paths']['database']}")
+    console.print(f"数据库: {report['database']}")
+    if report.get("stale_running_accounts"):
+        console.print(
+            f"[yellow]可疑 running 账号: {report['stale_running_accounts']} "
+            "（超过 30 分钟未更新）[/yellow]"
+        )
+    console.print("[bold]建议下一步[/bold]")
+    for action in report["next_actions"]:
+        console.print(f"  • {action}")
+
+
+@cli.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+@click.pass_context
+def doctor_cmd(ctx: click.Context, as_json: bool) -> None:
+    """运维体检：凭证、错误 TopN、卡住任务、建议动作。"""
+    cfg = ctx.obj["cfg"]
+    db = _db(cfg)
+    report = build_doctor_report(db, cfg)
+    if as_json:
+        console.print_json(data=report)
+        return
+    console.print(f"[bold]Doctor[/bold] · db={report['database']}")
+    platform = report["platform"]
+    console.print(
+        f"平台: backend={platform.get('backend')} configured={platform.get('configured')} "
+        f"expired={platform.get('expired')} remain_h={platform.get('remain_hours')}"
+    )
+    if report.get("stale_running_accounts"):
+        console.print(
+            f"[yellow]stale running accounts: {report['stale_running_accounts']}[/yellow]"
+        )
+    err = report["errors"]
+    table = Table(title="历史 list_error Top")
+    table.add_column("error")
+    table.add_column("count", justify="right")
+    for row in err.get("list_errors") or []:
+        table.add_row(str(row["error"])[:120], str(row["count"]))
+    if err.get("list_errors"):
+        console.print(table)
+    else:
+        console.print("历史 list_error: （无）")
+    table_r = Table(title="resolve_error Top")
+    table_r.add_column("error")
+    table_r.add_column("count", justify="right")
+    for row in err.get("resolve_errors") or []:
+        table_r.add_row(str(row["error"])[:120], str(row["count"]))
+    if err.get("resolve_errors"):
+        console.print(table_r)
+    console.print(
+        "分类: list="
+        + str(err.get("list_by_kind"))
+        + " resolve="
+        + str(err.get("resolve_by_kind"))
+        + " content="
+        + str(err.get("content_by_kind"))
+    )
+    console.print("[bold]建议下一步[/bold]")
+    for action in report["next_actions"]:
+        console.print(f"  • {action}")
+
+
+@cli.command("errors")
+@click.option("--limit", default=20, type=int, show_default=True)
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_context
+def errors_cmd(ctx: click.Context, limit: int, as_json: bool) -> None:
+    """按 list/resolve/content 错误聚合。"""
+    db = _db(ctx.obj["cfg"])
+    data = aggregate_errors(db, limit=limit)
+    if as_json:
+        console.print_json(data=data)
+        return
+    for title, key in (
+        ("历史列表错误", "list_errors"),
+        ("解析错误", "resolve_errors"),
+        ("正文错误", "content_errors"),
+    ):
+        table = Table(title=title)
+        table.add_column("error")
+        table.add_column("count", justify="right")
+        rows = data.get(key) or []
+        for row in rows:
+            table.add_row(str(row["error"])[:160], str(row["count"]))
+        if rows:
+            console.print(table)
+        else:
+            console.print(f"{title}: （无）")
+    console.print(f"list_by_kind: {data.get('list_by_kind')}")
+    console.print(f"resolve_by_kind: {data.get('resolve_by_kind')}")
+    console.print(f"content_by_kind: {data.get('content_by_kind')}")
+
+
+@cli.command("retry-resolve")
+@click.option("--limit", default=None, type=int, help="最多重置多少个账号")
+@click.pass_context
+def retry_resolve_cmd(ctx: click.Context, limit: int | None) -> None:
+    """将 resolve=failed 的账号重新放回 pending。"""
+    db = _db(ctx.obj["cfg"])
+    n = reset_failed_resolves(db, limit=limit)
+    console.print(f"已重置 {n} 个解析失败账号为 pending；请再运行 python run.py resolve")
 
 
 @cli.command("serve")
@@ -456,6 +589,24 @@ def export_jsonl(ctx: click.Context, out: str, status_filter: str) -> None:
             f.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
             count += 1
     console.print(f"[green]已导出 {count} 条 → {out_path}[/green]")
+
+
+@cli.command("export-account-summary")
+@click.option("--out", default="export/account_summary.jsonl", help="输出路径")
+@click.pass_context
+def export_account_summary_cmd(ctx: click.Context, out: str) -> None:
+    """按账号导出篇数、时间跨度与状态汇总（论文附录友好）。"""
+    cfg = ctx.obj["cfg"]
+    db = _db(cfg)
+    out_path = Path(out)
+    if not out_path.is_absolute():
+        out_path = Path(__file__).resolve().parents[1] / out_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = account_summary_rows(db)
+    with out_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    console.print(f"[green]已导出 {len(rows)} 个账号汇总 → {out_path}[/green]")
 
 
 @cli.command("backup-db")
@@ -529,7 +680,12 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
             console=console,
         ) as prog:
             stats = fetch_history_for_accounts(
-                db, client, cfg, limit_accounts=limit, progress=prog.callback
+                db,
+                client,
+                cfg,
+                limit_accounts=limit,
+                progress=prog.callback,
+                refresh=False,
             )
         console.print(stats)
     else:

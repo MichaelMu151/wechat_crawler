@@ -7,6 +7,13 @@ type Stats = {
   sessions?: number;
   platform_configured?: boolean;
   platform_backend?: string;
+  errors?: {
+    list_by_kind?: Record<string, number>;
+    resolve_by_kind?: Record<string, number>;
+    content_by_kind?: Record<string, number>;
+    list_errors?: { error: string; count: number }[];
+  };
+  next_actions?: string[];
 };
 type Article = {
   id: number;
@@ -126,17 +133,46 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [hasActiveJobs, refresh]);
 
-  const run = async (stage: string) => {
+  const run = async (stage: string, extra: Record<string, unknown> = {}) => {
     setPendingAction(stage);
     setError("");
     try {
       await api("/api/v1/jobs", {
         method: "POST",
-        body: JSON.stringify({ stage }),
+        body: JSON.stringify({ stage, ...extra }),
       });
       await refresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "任务提交失败");
+    } finally {
+      setPendingAction(null);
+    }
+  };
+
+  const retryResolve = async () => {
+    setPendingAction("retry-resolve");
+    setError("");
+    try {
+      await api("/api/v1/retry-resolve", { method: "POST", body: "{}" });
+      await run("resolve");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "重试解析失败");
+      setPendingAction(null);
+    }
+  };
+
+  const retryContent = async () => {
+    setPendingAction("retry-content");
+    setError("");
+    try {
+      // reuse job path: content will pick listed + retry_wait; failed need CLI retry-failed
+      await api("/api/v1/jobs", {
+        method: "POST",
+        body: JSON.stringify({ stage: "content" }),
+      });
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "重试正文失败");
     } finally {
       setPendingAction(null);
     }
@@ -231,10 +267,34 @@ export default function App() {
         />
       </section>
 
+      {(stats?.next_actions?.length || stats?.errors?.list_by_kind) && (
+        <section className="panel">
+          <h2>运维诊断</h2>
+          {stats?.errors?.list_by_kind && (
+            <p className="subtle">
+              历史错误：
+              {Object.entries(stats.errors.list_by_kind)
+                .map(([k, v]) => `${k}=${v}`)
+                .join(" · ") || "无"}
+              {stats.errors.resolve_by_kind
+                ? ` ｜ 解析：${Object.entries(stats.errors.resolve_by_kind)
+                    .map(([k, v]) => `${k}=${v}`)
+                    .join(" · ")}`
+                : ""}
+            </p>
+          )}
+          <ul className="subtle" style={{ margin: "0.5rem 0 0", paddingLeft: "1.2rem" }}>
+            {(stats?.next_actions ?? []).slice(0, 5).map((action) => (
+              <li key={action}>{action}</li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="panel actions">
         <div>
           <h2>采集任务</h2>
-          <p className="subtle">历史列表保持低并发，正文失败会自动退避重试。</p>
+          <p className="subtle">历史默认跳过已完成账号；频控会熔断暂停。正文失败会自动退避重试。</p>
         </div>
         <div className="buttonRow">
           {["import", "resolve", "history", "content"].map((stage) => (
@@ -247,6 +307,22 @@ export default function App() {
               {pendingAction === stage ? "提交中…" : STAGE_LABELS[stage]}
             </button>
           ))}
+          <button
+            disabled={hasRunningAction || activeStages.has("history")}
+            onClick={() => void run("history", { refresh: true })}
+          >
+            {pendingAction === "history" ? "提交中…" : "历史(含done刷新)"}
+          </button>
+          <button disabled={hasRunningAction} onClick={() => void retryResolve()}>
+            {pendingAction === "retry-resolve" || pendingAction === "resolve"
+              ? "处理中…"
+              : "重试解析失败"}
+          </button>
+          <button disabled={hasRunningAction} onClick={() => void retryContent()}>
+            {pendingAction === "retry-content" || pendingAction === "content"
+              ? "处理中…"
+              : "继续抓正文"}
+          </button>
         </div>
         <form onSubmit={(event) => void addUrl(event)}>
           <input

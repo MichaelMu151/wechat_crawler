@@ -13,13 +13,45 @@ def test_schema_migrates_and_recovers_running_accounts(tmp_path: Path) -> None:
             """
         )
 
-    recovered = db.recover_stale_work()
+    # CLI history start uses stale_minutes=0 to reclaim all running
+    recovered = db.recover_stale_work(stale_minutes=0)
 
     account = db.fetchone("SELECT * FROM accounts WHERE nickname_input='test'")
     assert recovered["accounts"] == 1
     assert account is not None
     assert account["list_status"] == "failed"
     assert "safe to retry" in account["list_error"]
+
+
+def test_recover_stale_work_keeps_recent_running_accounts(tmp_path: Path) -> None:
+    db = Database(tmp_path / "archive.db")
+    with db.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO accounts (nickname_input, list_status)
+            VALUES ('fresh', 'running')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO jobs (stage, status, started_at, heartbeat_at)
+            VALUES (
+                'content',
+                'running',
+                datetime('now','localtime'),
+                datetime('now','localtime')
+            )
+            """
+        )
+
+    recovered = db.recover_stale_work(stale_minutes=30)
+
+    account = db.fetchone("SELECT list_status FROM accounts WHERE nickname_input='fresh'")
+    job = db.fetchone("SELECT status FROM jobs")
+    assert recovered["accounts"] == 0
+    assert recovered["jobs"] == 0
+    assert account is not None and account["list_status"] == "running"
+    assert job is not None and job["status"] == "running"
 
 
 def test_recover_stale_work_keeps_recent_running_jobs(tmp_path: Path) -> None:

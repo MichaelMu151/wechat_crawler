@@ -164,6 +164,7 @@ class JobRunner:
                     limit_accounts=payload.get("limit"),
                     checkpoint=control.checkpoint,
                     progress=control.update_progress,
+                    refresh=bool(payload.get("refresh")),
                 )
             if stage == "content":
                 return fetch_pending_contents(
