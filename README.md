@@ -1,30 +1,33 @@
-# 微信公众号存档 · SQLite 离线库
+# 微信公众号存档 · SQLite 离线库（使用指南）
 
-本仓库**不再负责向微信拉列表或正文**。在线工作全部在 Schinza 里完成；这里只把
-Schinza 已经归档的结果，离线合并进原来的 `wechat_archive.db`，并提供 status / 导出。
+本仓库**不向微信拉列表、也不下正文**。在线工作全部用同级的 **Schinza 源码**（`python main.py`）完成；这里只把已经归档的文件合并进原来的 `wechat_archive.db`。
+
+不要下载 Schinza 的发行版 App。本流程依赖 fork 分支 `scalable-archive`（版本 1.9.2）的源码界面。
 
 ```text
 分工
-  Schinza   → 抓 30 分钟凭证、拉历史列表、慢速下正文
-  本仓库    → import-list + import-schinza-export → SQLite / JSONL
+  Schinza 源码   → 抓 30 分钟凭证、翻页拉列表、慢速下正文
+  本仓库         → import-list + import-schinza-export → SQLite / JSONL
 ```
-
-两个 GitHub 仓库是分开的，请放在同一工作目录：
 
 ```text
 wechat-work/
 ├── name_list.xlsx
 ├── wechat_crawler/                         ← 本仓库
-└── schinza-wechat-certificate-main/        ← Schinza
+└── schinza-wechat-certificate-main/        ← Schinza 源码
 ```
+
+当前跟踪分支：`cursor/wechat-archive-enhancements`。
 
 ---
 
 ## 你需要提前准备
 
 1. Git、Python 3.11+
-2. 已登录的微信桌面客户端，且只处理你有权存档的公众号
-3. Schinza（源码或发行版均可）
+2. 已登录的微信**桌面**客户端，且只处理你有权存档的公众号
+3. 同级目录里已按 [Schinza 中文指南](https://github.com/MichaelMu151/schinza-wechat-certificate/blob/scalable-archive/README.zh-CN.md) 用源码跑通抓包
+
+Intel Mac 跑 Schinza GUI 必须用 python.org 的 Python 3.14 虚拟环境 `.venv-intel`（Homebrew 3.13 没有 `_tkinter`）。本仓库的 CLI 不需要 Tk，用普通 `.venv` 即可。
 
 ---
 
@@ -44,7 +47,7 @@ git clone --branch scalable-archive \
   schinza-wechat-certificate-main
 ```
 
-之后更新：
+以后更新（两个目录都要 pull，不要切到 Schinza 上游 `main`）：
 
 ```bash
 cd "$HOME/Desktop/wechat-work/wechat_crawler" && git pull && cd ..
@@ -55,13 +58,16 @@ cd "$HOME/Desktop/wechat-work/schinza-wechat-certificate-main" && git pull && cd
 
 ## 第 2 步：名单 `name_list.xlsx`
 
-表头必须是两列，名称必须与 Schinza 里填写的公众号名**逐字一致**：
+放在两个仓库的**上一级**（默认路径写在 `config.yaml` 的 `paths.name_list`）。
 
 | nickname | link |
 |----------|------|
 | 云南省第一人民医院 | https://mp.weixin.qq.com/s/xxxxx |
 
-也可生成示例表：
+- `nickname` 必须与 Schinza 卡片上的公众号名称**逐字一致**（含空格、医院全称）。
+- `link` 是该号任意一篇公开文章，便于核对；没有链接也可以先导入名单。
+
+生成示例表：
 
 ```bash
 cd "$HOME/Desktop/wechat-work/wechat_crawler"
@@ -70,7 +76,7 @@ python3 scripts/create_name_list_example.py --out ../name_list.xlsx
 
 ---
 
-## 第 3 步：安装本仓库
+## 第 3 步：安装本仓库（离线库）
 
 ```bash
 cd "$HOME/Desktop/wechat-work/wechat_crawler"
@@ -81,33 +87,48 @@ pip install -r requirements.txt
 python run.py init-db
 ```
 
-可选：`bash scripts/setup_from_scratch.sh`（建 venv、装依赖、init-db、必要时生成示例名单）。
-它**不会**启动 Schinza 或操作微信。
+以后每次先：
+
+```bash
+cd "$HOME/Desktop/wechat-work/wechat_crawler"
+source .venv/bin/activate
+```
+
+提示符前出现 `(.venv)` 即可。可选一键脚本 `bash scripts/setup_from_scratch.sh` 会建 venv、装依赖、init-db；**不会**启动 Schinza 或操作微信。
 
 ---
 
-## 第 4 步：在 Schinza 里完成在线工作
+## 第 4 步：用 Schinza 源码完成全部在线工作
 
-凭证捕获、CA、代理流程见 Schinza 自己的 README，不要改。这里只说明和效率有关的部分：
+详细逐步操作（安装 CA、重启微信、添加公众号、30 分钟窗口只拉列表）见：
 
-1. 在「凭证管理」抓到该号凭证（约 **30 分钟**有效）。
-2. 打开「历史文章」，选该号，点 **拉取列表并归档**。
-3. **这 30 分钟只用来翻页拉列表**（getmsg 需要 `uin`/`key`）。正文是公开 HTML，**不消耗凭证**。
-4. 列表未拉完而窗口结束：立即续约，再点一次继续翻页。不要在列表还没完时去下正文。
-5. 列表拉完后，Schinza 会自动开始慢速下正文（单请求、每篇 8–15 秒）。
-6. 凭证已经过期、但列表已在本地：点 **继续归档正文**。过期的 cookie 不会带上，避免把公开页打成登录页。
+**https://github.com/MichaelMu151/schinza-wechat-certificate/blob/scalable-archive/README.zh-CN.md**
 
-结果在 Schinza 目录：
+本地启动（Intel Mac）：
+
+```bash
+cd "$HOME/Desktop/wechat-work/schinza-wechat-certificate-main"
+.venv-intel/bin/python main.py
+```
+
+Apple Silicon 用 `.venv-mac/bin/python main.py`；Windows 用 `.venv\Scripts\python.exe main.py`。  
+确认版本 `1.9.2`，历史页按钮是 **拉取列表并归档** / **继续归档正文**。不要打开 Applications 里的 `Schinza.app`。
+
+和本仓库衔接时只要记住：
+
+1. 名称与 `name_list.xlsx` 完全一致。
+2. **30 分钟凭证只用来翻页拉列表**；正文不消耗凭证。
+3. 列表没完就续约再点「拉取列表并归档」；过期后可点「继续归档正文」。
+4. 产物在：
 
 ```text
 schinza-wechat-certificate-main/data/archives/公众号名/
 ├── manifest.json
 ├── manifest.jsonl
-└── articles/          # Markdown / HTML / …
+└── articles/
 ```
 
-遇到 `unknownerror` / 429 /「访问过于频繁」：先停，等数小时到一天，再续跑同一账号。
-已完成正文会跳过。不要提高并发。
+遇到 `unknownerror` / 429 /「访问过于频繁」：在 Schinza 里停，等数小时到一天，同一账号续跑。不要在本仓库里再跑在线 `history` / `content`。
 
 ---
 
@@ -119,7 +140,9 @@ source .venv/bin/activate
 python run.py import-list
 ```
 
-先 dry-run：
+`inserted:0, skipped:N` 表示名单已经在库里，属于正常。
+
+先 dry-run（只报告、不写库）：
 
 ```bash
 python run.py import-schinza-export \
@@ -128,7 +151,7 @@ python run.py import-schinza-export \
   --dry-run
 ```
 
-确认 `matched_account=true` 后去掉 `--dry-run` 正式写入：
+确认输出里有 `matched_account=true`、篇数合理，再去掉 `--dry-run`：
 
 ```bash
 python run.py import-schinza-export \
@@ -139,20 +162,25 @@ python run.py export-jsonl
 python run.py export-account-summary
 ```
 
-该命令完全离线，不访问微信。按规范化文章 URL 去重；已有正文不会覆盖，只补新文章或旧库缺失的正文。
+该命令**完全离线**，不访问微信。按规范化文章 URL 去重；已有 `ok` 正文不会覆盖，只补新文章或旧库缺失的正文。超大号若 `manifest.json` 里没有嵌套 `articles`，以同目录 `manifest.jsonl` 为准（命令仍指向 `manifest.json` 即可）。
 
 | 路径 | 内容 |
 |------|------|
 | `data/wechat_archive.db` | SQLite 主库（与旧爬虫同一套表） |
 | `export/articles.jsonl` | 默认导出 `status=ok` 的文章 |
-| `export/account_summary.jsonl` | 按账号篇数、时间跨度、ok/failed 汇总 |
+| `export/account_summary.jsonl` | 按账号篇数、时间跨度、状态汇总 |
 
-`python run.py status` / `doctor` 看入库漏斗和建议。建议动作指向 Schinza 与
-`import-schinza-export`，而不是再跑在线 `history` / `content`。
+### 如何读 `python run.py status`
+
+上面一张表是**公众号**，下面一张是**文章**。离线导入成功后，常见情况是：
+
+- 账号：`resolve` 能对上名称，文章以 `ok` 为主（正文来自 Schinza 的 Markdown）。
+- 若 `matched_account=false`：两边名称不一致，改 Excel 或 Schinza 卡片后重新 `import-list` 再导入。
+- `doctor` 给出的下一步应指向「去 Schinza 归档 + `import-schinza-export`」，而不是 `python run.py history`。
 
 ---
 
-## 用 Python 分析
+## 第 6 步：用 Python 分析
 
 ```python
 import sqlite3
@@ -173,7 +201,7 @@ print(df.head())
 
 ---
 
-## 本仓库还保留哪些命令
+## 本仓库命令一览
 
 **日常使用**
 
@@ -181,16 +209,17 @@ print(df.head())
 |------|------|
 | `init-db` | 初始化 SQLite |
 | `import-list` | 导入 `name_list.xlsx` |
-| `import-schinza-export` | 离线合并 Schinza 归档 |
+| `import-schinza-export` | 离线合并 Schinza 归档目录 |
 | `status` / `doctor` / `errors` | 看库内进度 |
 | `export-jsonl` / `export-account-summary` | 导出 |
 | `backup-db` / `maintain-db` | 备份与维护 |
-| `schinza-status` | 只读检查 Schinza `accounts.json` 计数（不显示密钥） |
+| `schinza-status` | 只读检查 Schinza `accounts.json` 的计数（不显示密钥） |
 
-**已停用的在线抓取**（`history` / `content` / `resolve` / `pilot` / `serve` 等）
+**已停用的在线抓取**
 
-这些命令会直接报错，提示改走 Schinza。它们曾让 README 看起来像「爬虫还要再向微信请求一遍」，
-和 Schinza 重复、也更容易撞频控。若旧脚本仍依赖它们：
+`history`、`content`、`resolve`、`pilot`、`serve` 等默认会报错，提示改走 Schinza 源码。它们曾让文档看起来像「还要再向微信请求一遍」，和 Schinza 重复，也更容易撞频控。
+
+旧脚本若仍调用它们：
 
 ```bash
 python run.py --force-legacy history
@@ -204,10 +233,11 @@ python run.py --force-legacy history
 
 | 现象 | 处理 |
 |------|------|
-| `matched_account=false` | 公众号名与 `name_list.xlsx` / Schinza 不完全一致 |
+| `matched_account=false` | 公众号名与 Excel / Schinza 不完全一致 |
 | `import-list` → `inserted:0, skipped:N` | 名单已导入过，正常 |
-| 在线 `history` / `content` 被拒绝 | 预期行为；去 Schinza 拉，再 `import-schinza-export` |
-| Schinza 捕获不到凭证 | 重启微信，重新打开文章或滚动历史页 |
+| 运行 `history` / `content` 被拒绝 | 预期行为；用 Schinza 源码拉完再 `import-schinza-export` |
+| Schinza `No module named '_tkinter'` | Intel Mac 改用 `.venv-intel`（见 Schinza 指南第 3.1 节） |
+| Schinza 捕获不到凭证 | 完全退出并重启微信，重新打开文章或滚动历史页 |
 | 退出 Schinza 后网络异常 | 关闭系统手动代理 `127.0.0.1:8088` |
 
 ---
@@ -215,5 +245,5 @@ python run.py --force-legacy history
 ## 说明
 
 - 只存标题、作者、时间、正文等学术存档字段，不抓阅读量/点赞。
-- 当前跟踪分支：`cursor/wechat-archive-enhancements`。
-- Schinza 使用 MIT 许可证；本仓库只读其归档目录与（可选）`accounts.json`。
+- Schinza 使用 MIT 许可证；本仓库只读其归档目录与（可选）`accounts.json`，不会把 `uin`/`key` 写入 SQLite。
+- `config.yaml` 里仍有 `platform.schinza_accounts_path`，仅供 `schinza-status` 等只读检查；默认在线抓取路径已关闭。
