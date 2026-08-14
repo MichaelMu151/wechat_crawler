@@ -191,16 +191,14 @@ $HOME/Desktop/wechat-work/schinza-wechat-certificate-main/data/accounts.json
 
 ---
 
-## 第 6 步：在 Schinza 后台归档全部文章
+## 第 6 步：在 Schinza 一键拉取列表并归档正文
 
-在 Schinza 的“历史文章”中选择公众号和日期范围，例如
-`2018-01-01` 至 `2026-12-31`，拉取列表后点击 **后台归档全部**：
+在 Schinza 的“历史文章”中选择已有凭证的公众号（默认全部历史），点击 **拉取并归档正文**：
 
-- 不需要逐篇勾选；
-- 界面最多预览前 200 篇，完整列表仍会用于归档；
-- 历史分页和 offset 写入 `data/history_cache.sqlite`，重启 Schinza 后仍可续拉；
-- 正文最多使用 2 个有界 worker，请求错峰且批次间随机等待；
-- 每篇成功后立即保存，停止或崩溃后选择同一目录即可续跑；
+- 不需要勾选或浏览文章卡片，界面只显示篇数、页数、用时和正文进度；
+- 列表会自动翻页，拉完后自动开始正文归档；
+- 历史分页写入 `data/history_cache.sqlite`，正文写入 `data/archives/公众号名/`；
+- 停止或崩溃后，对同一账号再点一次即可续跑，已完成正文会跳过；
 - 出现微信频控时会自动暂停，不会继续硬跑。
 
 归档目录包含 `manifest.json`、流式 `manifest.jsonl`、`articles/*.md`、
