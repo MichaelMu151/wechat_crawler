@@ -59,13 +59,22 @@ def _progress_log_path(cfg: dict, name: str) -> Path:
     "--profile",
     type=click.Choice(sorted(PROFILES.keys())),
     default=None,
-    help="节奏档位：safe / balanced / fast（覆盖 crawl 间隔与熔断参数）",
+    help="节奏档位：safe / balanced / fast（仅 --force-legacy 在线命令使用）",
+)
+@click.option(
+    "--force-legacy",
+    is_flag=True,
+    default=False,
+    help="启用已弃用的在线 history/content/resolve/pilot/serve",
 )
 @click.pass_context
 def cli(
-    ctx: click.Context, config_path: str | None, profile: str | None
+    ctx: click.Context,
+    config_path: str | None,
+    profile: str | None,
+    force_legacy: bool,
 ) -> None:
-    """微信公众号学术存档爬虫（试点版）"""
+    """将 Schinza 离线归档合并进 SQLite（兼容原 wechat_archive.db）。"""
     try:
         cfg = load_config(config_path, profile=profile)
     except ValueError as exc:
@@ -73,8 +82,23 @@ def cli(
     ensure_dirs(cfg)
     ctx.ensure_object(dict)
     ctx.obj["cfg"] = cfg
+    ctx.obj["force_legacy"] = force_legacy
     if profile:
         console.print(f"[dim]profile={profile}[/dim]")
+
+
+LEGACY_ONLINE_HINT = (
+    "在线抓取已停用。请在 Schinza 拉列表与正文，再运行：\n"
+    "  python run.py import-list\n"
+    "  python run.py import-schinza-export --manifest <manifest.json> "
+    "--articles-dir <articles/>\n"
+    "若确需旧命令：python run.py --force-legacy history"
+)
+
+
+def _require_legacy(ctx: click.Context) -> None:
+    if not ctx.obj.get("force_legacy"):
+        raise click.ClickException(LEGACY_ONLINE_HINT)
 
 
 @cli.command("init-db")
@@ -102,7 +126,8 @@ def import_list_cmd(ctx: click.Context, xlsx: str | None) -> None:
 @click.option("--limit", default=None, type=int, help="最多处理多少个账号")
 @click.pass_context
 def resolve_cmd(ctx: click.Context, limit: int | None) -> None:
-    """解析公众号 fakeid/__biz（优先 searchbiz，回退样例链接）。"""
+    """[已弃用] 解析公众号 fakeid/__biz。请改用 Schinza + import-schinza-export。"""
+    _require_legacy(ctx)
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)
@@ -140,7 +165,8 @@ def set_platform_creds_cmd(
     fakeid: str,
     expire_days: int,
 ) -> None:
-    """手动写入公众平台 token/cookie（推荐配合浏览器登录 mp.weixin.qq.com）。"""
+    """[已弃用] 手动写入公众平台 token/cookie。"""
+    _require_legacy(ctx)
     import time
 
     cfg = ctx.obj["cfg"]
@@ -168,7 +194,8 @@ def set_platform_creds_cmd(
 def import_platform_from_download_api_cmd(
     ctx: click.Context, env_path: Path | None
 ) -> None:
-    """从 wechat-download-api 扫码登录后的 .env / credentials 导入凭证。"""
+    """[已弃用] 从 wechat-download-api 导入凭证。"""
+    _require_legacy(ctx)
     cfg = ctx.obj["cfg"]
     resolved = env_path
     if resolved is None:
@@ -218,7 +245,8 @@ def _schinza_accounts_path(cfg: dict) -> Path:
 def import_schinza_credentials_cmd(
     ctx: click.Context, accounts_file: Path | None
 ) -> None:
-    """按公众号名称映射 Schinza 账号；不会把密钥复制进 SQLite。"""
+    """[已弃用] 按名称映射 Schinza 账号以供在线 history。请改用 import-schinza-export。"""
+    _require_legacy(ctx)
     cfg = ctx.obj["cfg"]
     source = accounts_file or _schinza_accounts_path(cfg)
     try:
@@ -369,7 +397,8 @@ def platform_status_cmd(ctx: click.Context) -> None:
 )
 @click.pass_context
 def history_cmd(ctx: click.Context, limit: int | None, refresh: bool) -> None:
-    """拉取历史发文列表（默认使用 Schinza 短期凭证）。"""
+    """[已弃用] 在线拉取历史列表。请在 Schinza 拉列表后 import-schinza-export。"""
+    _require_legacy(ctx)
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     try:
@@ -438,7 +467,8 @@ def import_session_har_cmd(
     overwrite: bool,
     delete_source: bool,
 ) -> None:
-    """[已弃用] 旧 HAR 导入；请改用 Schinza accounts.json。"""
+    """[已弃用] 旧 HAR 导入。"""
+    _require_legacy(ctx)
     console.print(
         "[yellow]请优先用 Schinza 刷新凭证并运行 "
         "python run.py import-schinza-credentials。旧 HAR 命令仅兼容保留。[/yellow]"
@@ -478,7 +508,8 @@ def import_session_har_cmd(
 @click.option("--limit", default=None, type=int, help="最多抓取多少篇")
 @click.pass_context
 def content_cmd(ctx: click.Context, limit: int | None) -> None:
-    """抓取待处理文章正文。"""
+    """[已弃用] 在线抓取正文。请在 Schinza 归档后 import-schinza-export。"""
+    _require_legacy(ctx)
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)
@@ -647,7 +678,8 @@ def errors_cmd(ctx: click.Context, limit: int, as_json: bool) -> None:
 @click.option("--limit", default=None, type=int, help="最多重置多少个账号")
 @click.pass_context
 def retry_resolve_cmd(ctx: click.Context, limit: int | None) -> None:
-    """将 resolve=failed 的账号重新放回 pending。"""
+    """[已弃用] 将 resolve=failed 的账号重新放回 pending。"""
+    _require_legacy(ctx)
     db = _db(ctx.obj["cfg"])
     n = reset_failed_resolves(db, limit=limit)
     console.print(f"已重置 {n} 个解析失败账号为 pending；请再运行 python run.py resolve")
@@ -656,8 +688,10 @@ def retry_resolve_cmd(ctx: click.Context, limit: int | None) -> None:
 @cli.command("serve")
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=8000, type=int, show_default=True)
-def serve_cmd(host: str, port: int) -> None:
-    """启动本地 API、任务执行器和已构建的管理台。"""
+@click.pass_context
+def serve_cmd(ctx: click.Context, host: str, port: int) -> None:
+    """[已弃用] 启动本地 Web 管理台。"""
+    _require_legacy(ctx)
     import uvicorn
 
     uvicorn.run("wechat_archive.api.app:app", host=host, port=port)
@@ -667,7 +701,8 @@ def serve_cmd(host: str, port: int) -> None:
 @click.option("--limit", default=None, type=int, help="最多重置多少篇")
 @click.pass_context
 def retry_failed_cmd(ctx: click.Context, limit: int | None) -> None:
-    """将已耗尽重试的正文任务重新放回队列。"""
+    """[已弃用] 将已耗尽重试的正文任务重新放回队列。"""
+    _require_legacy(ctx)
     db = _db(ctx.obj["cfg"])
     sql = "SELECT id FROM articles WHERE status='failed' ORDER BY id"
     params: tuple = ()
@@ -775,7 +810,8 @@ def maintain_db_cmd(ctx: click.Context, event_retention_days: int) -> None:
 @click.option("--limit", default=None, type=int, help="限制账号数")
 @click.pass_context
 def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
-    """一键试点：导入 → 映射凭证 → 拉历史 → 抓正文。"""
+    """[已弃用] 一键在线试点。请改用 Schinza + import-schinza-export。"""
+    _require_legacy(ctx)
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)

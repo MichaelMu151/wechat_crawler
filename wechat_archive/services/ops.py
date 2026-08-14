@@ -138,12 +138,13 @@ def suggest_next_actions(db: Database, cfg: dict[str, Any] | None = None) -> lis
             schinza = None
         if not schinza:
             actions.append(
-                "找不到 Schinza 凭证 → 启动 Schinza 刷新后运行 "
-                "python run.py import-schinza-credentials"
+                "找不到 Schinza 凭证文件 → 这不影响离线导入。"
+                "在 Schinza 归档后运行 python run.py import-schinza-export"
             )
         elif not schinza["active"]:
             actions.append(
-                "Schinza 没有有效凭证 → 在 Schinza 中刷新目标公众号后重新导入"
+                "Schinza 没有有效凭证 → 拉列表请先在 Schinza 续约；"
+                "已有归档可直接 python run.py import-schinza-export"
             )
     elif cfg and not creds and backend != "download_api":
         actions.append(
@@ -155,46 +156,73 @@ def suggest_next_actions(db: Database, cfg: dict[str, Any] | None = None) -> lis
     if ns:
         if backend == "schinza_getmsg":
             actions.append(
-                f"{ns} 个账号 need_session → 在 Schinza 中刷新后运行 "
-                "import-schinza-credentials，再重跑 history"
+                f"{ns} 个账号 need_session → 在 Schinza 中拉列表与正文，再运行 "
+                "python run.py import-schinza-export"
             )
         else:
             actions.append(
-                f"{ns} 个账号 need_session → 更新凭证后重跑 python run.py history"
+                f"{ns} 个账号 need_session → 更新凭证后重跑 python run.py --force-legacy history"
             )
     if lr >= 3:
         wait_m = int((cfg.get("crawl") or {}).get("history_global_cooldown", 3600)) // 60
-        actions.append(
-            f"检测到 {lr} 个历史限流错误 → 先停 {max(wait_m, 30)} 分钟，"
-            "再用 --profile safe 运行 history"
-        )
+        if backend == "schinza_getmsg":
+            actions.append(
+                f"检测到 {lr} 个历史限流错误 → 先停 {max(wait_m, 30)} 分钟，"
+                "改在 Schinza 中慢速拉列表，完成后 import-schinza-export"
+            )
+        else:
+            actions.append(
+                f"检测到 {lr} 个历史限流错误 → 先停 {max(wait_m, 30)} 分钟，"
+                "再用 --profile safe 运行 python run.py --force-legacy history"
+            )
     if rn:
         actions.append(
-            f"{rn} 个账号仍为 running（可能中断）→ 下次 history 会自动回收；"
-            "或先 python run.py doctor"
+            f"{rn} 个账号仍为 running（可能中断）→ 请改用 Schinza 续拉列表，"
+            "再 python run.py import-schinza-export"
         )
     if rp and backend == "schinza_getmsg":
         actions.append(
-            f"{rp} 个账号尚未匹配 Schinza → 刷新对应凭证并运行 "
-            "python run.py import-schinza-credentials"
+            f"{rp} 个账号尚未匹配 → 先 python run.py import-list，"
+            "并确保 Schinza 公众号名称与名单完全一致，再 import-schinza-export"
         )
     elif rp:
-        actions.append(f"{rp} 个账号待解析 → python run.py resolve")
+        actions.append(
+            f"{rp} 个账号待解析 → python run.py --force-legacy resolve"
+        )
     if rf and backend != "schinza_getmsg":
         actions.append(
-            f"{rf} 个账号 resolve 失败 → python run.py retry-resolve 后再 resolve"
+            f"{rf} 个账号 resolve 失败 → python run.py --force-legacy retry-resolve"
         )
     if lp and lr < 3:
-        actions.append(
-            f"{lp} 个账号待拉/可重试历史列表 → python run.py history"
-            "（默认跳过 done；增量刷新加 --refresh）"
-        )
+        if backend == "schinza_getmsg":
+            actions.append(
+                f"{lp} 个账号待拉历史列表 → 在 Schinza 拉完列表与正文后 "
+                "python run.py import-schinza-export"
+            )
+        else:
+            actions.append(
+                f"{lp} 个账号待拉/可重试历史列表 → python run.py --force-legacy history"
+            )
     if li:
-        actions.append(f"{li} 篇正文待抓 → python run.py content")
+        if backend == "schinza_getmsg":
+            actions.append(
+                f"{li} 篇正文待入库 → 在 Schinza 归档后 python run.py import-schinza-export"
+            )
+        else:
+            actions.append(
+                f"{li} 篇正文待抓 → python run.py --force-legacy content"
+            )
     if cf:
-        actions.append(
-            f"{cf} 篇正文 failed → python run.py retry-failed 后再 content"
-        )
+        if backend == "schinza_getmsg":
+            actions.append(
+                f"{cf} 篇正文 failed → 在 Schinza 对同一账号续跑正文后 "
+                "再 import-schinza-export（已有 ok 正文不会覆盖）"
+            )
+        else:
+            actions.append(
+                f"{cf} 篇正文 failed → python run.py --force-legacy retry-failed "
+                "后再 --force-legacy content"
+            )
     if not actions:
         actions.append("暂无待办：可 python run.py status 或 export-jsonl / export-account-summary")
     return actions
