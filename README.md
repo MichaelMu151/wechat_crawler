@@ -191,49 +191,56 @@ $HOME/Desktop/wechat-work/schinza-wechat-certificate-main/data/accounts.json
 
 ---
 
-## 第 6 步：把 Schinza 账号映射导入爬虫
+## 第 6 步：在 Schinza 后台归档全部文章
 
-回到爬虫终端（有 `(.venv)`）：
+在 Schinza 的“历史文章”中选择公众号和日期范围，例如
+`2018-01-01` 至 `2026-12-31`，拉取列表后点击 **后台归档全部**：
 
-```bash
-cd "$HOME/Desktop/wechat-work/wechat_crawler"
-source .venv/bin/activate
+- 不需要逐篇勾选；
+- 界面最多预览前 200 篇，完整列表仍会用于归档；
+- 历史分页和 offset 写入 `data/history_cache.sqlite`，重启 Schinza 后仍可续拉；
+- 正文最多使用 2 个有界 worker，请求错峰且批次间随机等待；
+- 每篇成功后立即保存，停止或崩溃后选择同一目录即可续跑；
+- 出现微信频控时会自动暂停，不会继续硬跑。
 
-# 默认只读 ../schinza-wechat-certificate-main/data/accounts.json
-# 密钥不会复制进 SQLite
-python run.py import-schinza-credentials
-python run.py schinza-status
-```
-
-若 active 和 mapped 均大于 0，继续下一步。若出现 duplicate 或 unmatched，
-请修正 Schinza 名称后重新导入。过期后在 Schinza 中刷新该号，再重复本步骤。
+归档目录包含 `manifest.json`、流式 `manifest.jsonl`、`articles/*.md`、
+`archive_index.sqlite`、`job_state.jsonl`、`failures.jsonl` 和
+`summary.json`。超过 1 万篇时，目录清单以 JSONL 存储，避免巨大嵌套 JSON；
+其中不包含微信短期密钥。
 
 ---
 
-## 第 7 步：开始爬取
+## 第 7 步：离线合并到原 SQLite
+
+先导入账号名单：
 
 ```bash
 cd "$HOME/Desktop/wechat-work/wechat_crawler"
 source .venv/bin/activate
-
-# 1) 导入名单（默认读取上一级目录的 name_list.xlsx）
-#    可重复执行：已存在的 nickname+link 会 skipped，不会重复插入
 python run.py import-list
-
-# 2) 先小规模试跑（Schinza 路径不需要 resolve）
-python run.py --profile safe history --limit 1
-python run.py content --limit 10
-python run.py status
-python run.py doctor
-
-# 3) 确认无误后，去掉 --limit 做全量（历史仍建议使用 safe）
-# python run.py --profile safe history
-# python run.py content
-
-# 4) 导出（文章明细 + 按账号汇总）
-python run.py export-jsonl
-python run.py export-account-summary
 ```
+
+第一次先执行 dry-run，只报告而不写库：
+
+```bash
+python run.py import-schinza-export \
+  --manifest "../schinza-wechat-certificate-main/data/archives/公众号名称/manifest.json" \
+  --articles-dir "../schinza-wechat-certificate-main/data/archives/公众号名称/articles" \
+  --dry-run
+```
+
+确认 `matched_account=true`、数量合理后，去掉 `--dry-run` 正式合并：
+
+```bash
+python run.py import-schinza-export \
+  --manifest "../schinza-wechat-certificate-main/data/archives/公众号名称/manifest.json" \
+  --articles-dir "../schinza-wechat-certificate-main/data/archives/公众号名称/articles"
+python run.py status
+```
+
+该命令完全离线，不访问微信。它按规范化文章 URL 去重；已有正文不会覆盖，
+只有新文章或旧库缺失的正文会补入。旧版 Schinza 导出的列表 JSON与散落的 Markdown
+也支持导入：将 `--manifest` 指向列表 JSON、`--articles-dir` 指向 Markdown 所在目录即可。
 
 结果位置（均在爬虫目录内）：
 

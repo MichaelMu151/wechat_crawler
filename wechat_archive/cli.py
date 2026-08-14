@@ -25,6 +25,7 @@ from wechat_archive.services.fetch_content import fetch_pending_contents
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 from wechat_archive.services.import_accounts import import_name_list
 from wechat_archive.services.import_schinza import import_schinza_credentials
+from wechat_archive.services.import_schinza_export import import_schinza_export
 from wechat_archive.services.ops import (
     account_summary_rows,
     aggregate_errors,
@@ -233,6 +234,48 @@ def import_schinza_credentials_cmd(
             f"[yellow]{result['unmatched_crawler']} 个名单账号未匹配；"
             "请确保 Schinza 名称与 name_list.xlsx 完全一致。[/yellow]"
         )
+
+
+@cli.command("import-schinza-export")
+@click.option(
+    "--manifest",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Schinza 导出的列表 JSON 或后台归档 manifest.json",
+)
+@click.option(
+    "--articles-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Markdown 正文目录；默认从 manifest 所在目录递归查找",
+)
+@click.option("--dry-run", is_flag=True, help="只报告合并结果，不写入 SQLite")
+@click.pass_context
+def import_schinza_export_cmd(
+    ctx: click.Context,
+    manifest: Path,
+    articles_dir: Path | None,
+    dry_run: bool,
+) -> None:
+    """离线合并 Schinza 列表和 Markdown；不会访问微信。"""
+    try:
+        result = import_schinza_export(
+            _db(ctx.obj["cfg"]),
+            manifest,
+            articles_dir=articles_dir,
+            dry_run=dry_run,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=result)
+    if not result.get("matched_account"):
+        console.print(
+            "[yellow]未匹配 crawler 账号；请先 import-list，并确保公众号名称完全一致。[/yellow]"
+        )
+    elif dry_run:
+        console.print("[green]dry-run 完成，数据库未修改。[/green]")
+    else:
+        console.print("[green]Schinza 导出已离线合并到 SQLite。[/green]")
 
 
 @cli.command("schinza-status")
