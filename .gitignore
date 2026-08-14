@@ -5,6 +5,7 @@ venv/
 *.egg-info/
 data/*.db
 data/*.db-*
+data/logs/
 sessions/session_*.yaml
 sessions/platform_credentials.yaml
 !sessions/example_session.yaml

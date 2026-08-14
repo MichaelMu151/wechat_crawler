@@ -1,6 +1,28 @@
+import sqlite3
 from pathlib import Path
 
 from wechat_archive.db import Database
+
+
+def test_existing_database_adds_schinza_columns(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY,
+            nickname_input TEXT NOT NULL,
+            biz TEXT UNIQUE,
+            list_status TEXT NOT NULL DEFAULT 'pending'
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    columns = {row["name"] for row in db.fetchall("PRAGMA table_info(accounts)")}
+    assert {"wechat_biz", "schinza_account_id", "history_backend"} <= columns
 
 
 def test_schema_migrates_and_recovers_running_accounts(tmp_path: Path) -> None:

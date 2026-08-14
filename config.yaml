@@ -1,9 +1,9 @@
-# 默认约定：两个仓库同级放置
+# 默认约定：Schinza 与 crawler 同级放置
 #
 #   wechat-work/
 #     name_list.xlsx
 #     wechat_crawler/          ← 本项目
-#     wechat-download-api/     ← 另一个 GitHub 仓库
+#     schinza-wechat-certificate-main/  ← Schinza 桌面凭证工具
 #
 # 可用 CLI --profile safe|balanced|fast 覆盖 crawl 节奏（见 wechat_archive/config.py）
 
@@ -15,10 +15,11 @@ paths:
   platform_credentials: sessions/platform_credentials.yaml
 
 # 历史列表后端：
-# - platform: 直接用公众号后台凭证调 searchbiz / appmsgpublish（推荐）
-# - download_api: 调用同级 wechat-download-api 的 HTTP 接口
+# - schinza_getmsg: 读取 Schinza 短期凭证（默认）
+# - platform / download_api: 旧公众平台渠道，仅作兼容 fallback
 platform:
-  backend: platform
+  backend: schinza_getmsg
+  schinza_accounts_path: ../schinza-wechat-certificate-main/data/accounts.json
   download_api_base_url: http://127.0.0.1:5000
   # import-platform-from-download-api 未传 --env 时使用此路径
   download_api_env: ../wechat-download-api/.env
@@ -34,6 +35,8 @@ crawl:
   history_page_size: 15
   history_page_size_min: 5
   history_page_size_max: 40
+  # 每个账号每次最多翻页数；达到后保留 checkpoint，下次续跑
+  history_max_pages_per_account: 100
   # 账号与正文都按有界批次读取
   account_batch_size: 200
   content_batch_size: 500

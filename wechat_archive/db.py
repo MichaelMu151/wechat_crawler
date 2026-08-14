@@ -112,6 +112,11 @@ ARTICLE_COLUMNS = {
 
 ACCOUNT_COLUMNS = {
     "last_listed_at": "TEXT",
+    # Schinza's getmsg identity is separate from the legacy ``biz`` column,
+    # which existing installations use for a public-platform fakeid.
+    "wechat_biz": "TEXT",
+    "schinza_account_id": "TEXT",
+    "history_backend": "TEXT",
 }
 
 
@@ -158,6 +163,14 @@ class Database:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_articles_list "
                 "ON articles(COALESCE(publish_ts, 0) DESC, id DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_accounts_wechat_biz "
+                "ON accounts(wechat_biz)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_accounts_history_backend "
+                "ON accounts(history_backend, list_status, id)"
             )
             self._init_fts(conn)
 

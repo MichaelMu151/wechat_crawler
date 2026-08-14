@@ -10,7 +10,8 @@ paths:
   platform_credentials: sessions/platform_credentials.yaml
 
 platform:
-  backend: platform
+  backend: schinza_getmsg
+  schinza_accounts_path: ../schinza-wechat-certificate-main/data/accounts.json
   download_api_base_url: http://127.0.0.1:5000
   download_api_env: ../wechat-download-api/.env
 
@@ -22,6 +23,7 @@ crawl:
   history_page_size: 10
   history_page_size_min: 5
   history_page_size_max: 20
+  history_max_pages_per_account: 50
   account_batch_size: 200
   content_batch_size: 200
   content_sleep_min: 2.5
@@ -29,7 +31,8 @@ crawl:
   content_concurrency: 1
   content_max_retries: 3
   content_circuit_breaker_threshold: 3
-  history_rate_limit_retries: 3
+  # getmsg 风控不在进程内硬重试，直接冷却并等待刷新会话
+  history_rate_limit_retries: 0
   history_rate_limit_cooldown: 900
   history_circuit_breaker_threshold: 2
   history_global_cooldown: 7200
