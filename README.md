@@ -199,6 +199,7 @@ $HOME/Desktop/wechat-work/schinza-wechat-certificate-main/data/accounts.json
 - 列表会自动翻页，拉完后自动开始正文归档；
 - 历史分页写入 `data/history_cache.sqlite`，正文写入 `data/archives/公众号名/`；
 - 停止或崩溃后，对同一账号再点一次即可续跑，已完成正文会跳过；
+- 正文单请求、每篇随机等待 8–15 秒；短暂网络失败会退避重试；
 - 出现微信频控时会自动暂停，不会继续硬跑。
 
 归档目录包含 `manifest.json`、流式 `manifest.jsonl`、`articles/*.md`、
