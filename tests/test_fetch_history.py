@@ -207,3 +207,59 @@ def test_history_circuit_breaker_stops_after_consecutive_rate_limits(
     )
     assert failed is not None
     assert str(failed["list_error"]).startswith("rate_limited:")
+
+
+def test_schinza_history_uses_wechat_biz_without_legacy_resolve(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    db = Database(tmp_path / "archive.db")
+    db.execute(
+        """
+        INSERT INTO accounts (
+            nickname_input, wechat_biz, history_backend, resolve_status, list_status
+        ) VALUES ('sample', 'MzWechatBiz==', 'schinza_getmsg', 'ok', 'pending')
+        """
+    )
+    fake = FakePlatform()
+    monkeypatch.setattr(fetch_history_module, "build_history_client", lambda _cfg: fake)
+    cfg = _cfg(tmp_path)
+    cfg["platform"] = {"backend": "schinza_getmsg"}
+    stats = fetch_history_for_accounts(db, None, cfg)
+    assert stats["accounts_ok"] == 1
+    assert fake.calls[0][0] == "MzWechatBiz=="
+
+
+def test_history_page_cap_keeps_checkpoint_for_resume(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    db = Database(tmp_path / "archive.db")
+    db.execute(
+        """
+        INSERT INTO accounts (nickname_input, biz, resolve_status, list_status)
+        VALUES ('sample', 'MzFakeId==', 'ok', 'pending')
+        """
+    )
+
+    class EndlessPlatform(FakePlatform):
+        def list_articles(self, fakeid: str, begin: int = 0, count: int = 20, keyword=None):
+            page = super().list_articles(fakeid, 0, count, keyword)
+            page["begin"] = begin
+            page["next_begin"] = begin + 1
+            page["can_continue"] = True
+            page["publish_fetched"] = 1
+            return page
+
+    monkeypatch.setattr(
+        fetch_history_module, "build_history_client", lambda _cfg: EndlessPlatform()
+    )
+    stats = fetch_history_for_accounts(
+        db,
+        None,
+        _cfg(tmp_path, history_max_pages_per_account=2),
+    )
+    assert stats["accounts_fail"] == 0
+    account = db.fetchone("SELECT list_status, list_error FROM accounts")
+    assert account["list_status"] == "retry_wait"
+    assert "page cap" in account["list_error"]
+    checkpoint = db.fetchone("SELECT history_offset FROM crawl_checkpoints")
+    assert checkpoint["history_offset"] == 2

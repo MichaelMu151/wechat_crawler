@@ -458,6 +458,20 @@ def build_history_client(cfg: dict[str, Any]):
     """根据 config 构建历史列表客户端。"""
     backend = (cfg.get("platform") or {}).get("backend", "platform")
     timeout = int(cfg.get("http", {}).get("timeout", 30))
+    if backend == "schinza_getmsg":
+        from wechat_archive.schinza_client import SchinzaGetmsgClient
+
+        path = (cfg.get("platform") or {}).get("schinza_accounts_path", "")
+        if not path:
+            raise PlatformAuthError(
+                "platform.backend=schinza_getmsg 但未配置 schinza_accounts_path"
+            )
+        return SchinzaGetmsgClient(
+            path,
+            timeout=timeout,
+            retries=int(cfg.get("http", {}).get("max_retries", 2)),
+            backoff_factor=float(cfg.get("http", {}).get("backoff_factor", 1.0)),
+        )
     if backend == "download_api":
         base = (cfg.get("platform") or {}).get("download_api_base_url", "").strip()
         if not base:

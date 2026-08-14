@@ -73,6 +73,8 @@ def fetch_history_for_accounts(
     )
 
     platform = build_history_client(cfg)
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    schinza_backend = backend == "schinza_getmsg"
 
     sleep_min = float(cfg["crawl"]["sleep_min"])
     sleep_max = float(cfg["crawl"]["sleep_max"])
@@ -99,11 +101,16 @@ def fetch_history_for_accounts(
     status_sql = _list_status_clause(refresh)
 
     account_batch_size = max(1, int(cfg["crawl"].get("account_batch_size", 200)))
+    identity_filter = (
+        "history_backend='schinza_getmsg' AND wechat_biz IS NOT NULL"
+        if schinza_backend
+        else "resolve_status='ok' AND biz IS NOT NULL"
+    )
     total_row = db.fetchone(
         f"""
         SELECT COUNT(*) AS count
         FROM accounts
-        WHERE resolve_status='ok' AND biz IS NOT NULL
+        WHERE {identity_filter}
           AND list_status IN ({status_sql})
         """
     )
@@ -136,9 +143,11 @@ def fetch_history_for_accounts(
             remaining = accounts_total - processed_accounts
             accounts = db.fetchall(
                 f"""
-                SELECT id, biz, account_name, nickname_input, list_status
+                SELECT id,
+                       {'wechat_biz' if schinza_backend else 'biz'} AS biz,
+                       account_name, nickname_input, list_status
                 FROM accounts
-                WHERE resolve_status='ok' AND biz IS NOT NULL
+                WHERE {identity_filter}
                   AND list_status IN ({status_sql})
                   AND id > ?
                 ORDER BY id
@@ -311,8 +320,15 @@ def _fetch_history_for_account(
     reached_old = False
     articles_added = 0
     pages_done = 0
-    rate_limit_retries = int(cfg["crawl"].get("history_rate_limit_retries", 2))
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    rate_limit_retries = (
+        0
+        if backend == "schinza_getmsg"
+        else int(cfg["crawl"].get("history_rate_limit_retries", 2))
+    )
     rate_limit_cooldown = float(cfg["crawl"].get("history_rate_limit_cooldown", 900))
+    max_pages = max(1, int(cfg["crawl"].get("history_max_pages_per_account", 100)))
+    hit_page_cap = False
 
     try:
         while True:
@@ -440,10 +456,33 @@ def _fetch_history_for_account(
                     ),
                 )
 
-            if reached_old or not can_continue or not rows:
+            no_pushes = not rows and int(page.get("publish_fetched") or 0) <= 0
+            if reached_old or not can_continue or no_pushes:
+                break
+            if pages_done >= max_pages:
+                hit_page_cap = True
                 break
             offset = int(page.get("next_begin") or (offset + page_size))
             cooperative_sleep(random.uniform(sleep_min, sleep_max), checkpoint)
+
+        if hit_page_cap:
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET list_status='retry_wait',
+                        list_error='api: reached configured page cap; safe to resume',
+                        updated_at=datetime('now','localtime')
+                    WHERE id=?
+                    """,
+                    (account_id,),
+                )
+            return {
+                "accounts_ok": 0,
+                "accounts_fail": 0,
+                "articles_upserted": articles_added,
+                "partial": True,
+            }
 
         with db.connection() as conn:
             conn.execute(

@@ -16,6 +16,7 @@ PROFILES: dict[str, dict[str, Any]] = {
             "history_page_size": 10,
             "history_page_size_min": 5,
             "history_page_size_max": 20,
+            "history_max_pages_per_account": 50,
             "history_rate_limit_retries": 3,
             "history_rate_limit_cooldown": 900,
             "history_circuit_breaker_threshold": 2,
@@ -34,6 +35,7 @@ PROFILES: dict[str, dict[str, Any]] = {
             "history_page_size": 15,
             "history_page_size_min": 5,
             "history_page_size_max": 40,
+            "history_max_pages_per_account": 100,
             "history_rate_limit_retries": 2,
             "history_rate_limit_cooldown": 900,
             "history_circuit_breaker_threshold": 3,
@@ -53,6 +55,7 @@ PROFILES: dict[str, dict[str, Any]] = {
             "history_page_size": 15,
             "history_page_size_min": 5,
             "history_page_size_max": 40,
+            "history_max_pages_per_account": 100,
             "history_rate_limit_retries": 2,
             "history_rate_limit_cooldown": 900,
             "history_circuit_breaker_threshold": 3,
@@ -113,9 +116,10 @@ def load_config(
     )
     # 解析 download_api_env 相对路径
     platform = cfg["platform"]
-    env_path = platform.get("download_api_env")
-    if env_path and not Path(env_path).is_absolute():
-        platform["download_api_env"] = str((ROOT / env_path).resolve())
+    for key in ("download_api_env", "schinza_accounts_path"):
+        configured_path = platform.get(key)
+        if configured_path and not Path(configured_path).is_absolute():
+            platform[key] = str((ROOT / configured_path).resolve())
 
     if profile:
         cfg = apply_profile(cfg, profile)

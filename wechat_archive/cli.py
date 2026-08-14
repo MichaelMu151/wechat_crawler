@@ -24,6 +24,7 @@ from wechat_archive.progress_ui import CrawlProgress
 from wechat_archive.services.fetch_content import fetch_pending_contents
 from wechat_archive.services.fetch_history import fetch_history_for_accounts
 from wechat_archive.services.import_accounts import import_name_list
+from wechat_archive.services.import_schinza import import_schinza_credentials
 from wechat_archive.services.ops import (
     account_summary_rows,
     aggregate_errors,
@@ -36,6 +37,7 @@ from wechat_archive.services.session_import import (
     import_session_from_har,
 )
 from wechat_archive.url_utils import article_sn, normalize_article_url
+from wechat_archive.schinza_client import summarize_schinza_accounts
 
 console = Console()
 
@@ -193,15 +195,90 @@ def import_platform_from_download_api_cmd(
         console.print(f"登录公众号: {creds.nickname}")
 
 
+def _schinza_accounts_path(cfg: dict) -> Path:
+    raw = (cfg.get("platform") or {}).get("schinza_accounts_path")
+    if not raw:
+        raise click.ClickException(
+            "未配置 platform.schinza_accounts_path；"
+            "默认同级布局应指向 ../schinza-wechat-certificate-main/data/accounts.json"
+        )
+    return Path(raw)
+
+
+@cli.command("import-schinza-credentials")
+@click.option(
+    "--file",
+    "accounts_file",
+    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+    default=None,
+    help="Schinza data/accounts.json；默认读 config.yaml",
+)
+@click.pass_context
+def import_schinza_credentials_cmd(
+    ctx: click.Context, accounts_file: Path | None
+) -> None:
+    """按公众号名称映射 Schinza 账号；不会把密钥复制进 SQLite。"""
+    cfg = ctx.obj["cfg"]
+    source = accounts_file or _schinza_accounts_path(cfg)
+    try:
+        result = import_schinza_credentials(_db(cfg), source)
+    except PlatformAuthError as exc:
+        raise click.ClickException(str(exc)) from exc
+    safe_result = {key: value for key, value in result.items() if key != "details"}
+    console.print_json(data=safe_result)
+    if result["duplicates"]:
+        console.print("[yellow]存在同名 Schinza 账号，已跳过以避免绑错号。[/yellow]")
+    if result["unmatched_crawler"]:
+        console.print(
+            f"[yellow]{result['unmatched_crawler']} 个名单账号未匹配；"
+            "请确保 Schinza 名称与 name_list.xlsx 完全一致。[/yellow]"
+        )
+
+
+@cli.command("schinza-status")
+@click.option(
+    "--file",
+    "accounts_file",
+    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+    default=None,
+)
+@click.pass_context
+def schinza_status_cmd(ctx: click.Context, accounts_file: Path | None) -> None:
+    """检查 Schinza 凭证文件，仅输出计数和同名冲突，不显示密钥。"""
+    cfg = ctx.obj["cfg"]
+    source = accounts_file or _schinza_accounts_path(cfg)
+    try:
+        summary = summarize_schinza_accounts(source)
+    except PlatformAuthError as exc:
+        raise click.ClickException(str(exc)) from exc
+    console.print_json(data=summary)
+    mapped = _db(cfg).fetchone(
+        """
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN list_status='need_session' THEN 1 ELSE 0 END) AS expired
+        FROM accounts
+        WHERE history_backend='schinza_getmsg' AND wechat_biz IS NOT NULL
+        """
+    )
+    console.print(
+        f"SQLite 已映射: {int(mapped['total'] or 0)}，"
+        f"need_session: {int(mapped['expired'] or 0)}"
+    )
+
+
 @cli.command("platform-status")
 @click.pass_context
 def platform_status_cmd(ctx: click.Context) -> None:
-    """检查公众平台凭证与后端模式。"""
+    """检查当前历史后端及其凭证状态。"""
     import time
 
     cfg = ctx.obj["cfg"]
     backend = (cfg.get("platform") or {}).get("backend", "platform")
     console.print(f"历史后端: {backend}")
+    if backend == "schinza_getmsg":
+        ctx.invoke(schinza_status_cmd)
+        return
     if backend == "download_api":
         base = (cfg.get("platform") or {}).get("download_api_base_url")
         console.print(f"download_api: {base}")
@@ -249,21 +326,25 @@ def platform_status_cmd(ctx: click.Context) -> None:
 )
 @click.pass_context
 def history_cmd(ctx: click.Context, limit: int | None, refresh: bool) -> None:
-    """拉取历史发文列表（需要公众平台凭证，不再依赖 getmsg 抓包）。"""
+    """拉取历史发文列表（默认使用 Schinza 短期凭证）。"""
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     try:
         build_history_client(cfg)
     except PlatformAuthError as exc:
         console.print(f"[yellow]{exc}[/yellow]")
-        console.print(
-            "推荐流程：\n"
-            "1. 同级目录 clone 并启动 wechat-download-api，浏览器扫码登录\n"
-            "2. python run.py import-platform-from-download-api\n"
-            "   （默认读取 ../wechat-download-api/.env）\n"
-            "3. python run.py platform-status\n"
-            "详见 README。"
-        )
+        if (cfg.get("platform") or {}).get("backend") == "schinza_getmsg":
+            console.print(
+                "推荐流程：\n"
+                "1. 在 Schinza 中为目标公众号刷新凭证\n"
+                "2. python run.py import-schinza-credentials\n"
+                "3. python run.py schinza-status\n"
+                "详见 README。"
+            )
+        else:
+            console.print(
+                "Legacy 流程：重新登录公众平台并导入凭证；详见 README。"
+            )
         return
     client = HttpClient(cfg)
     with CrawlProgress(
@@ -314,11 +395,10 @@ def import_session_har_cmd(
     overwrite: bool,
     delete_source: bool,
 ) -> None:
-    """[已弃用] 旧版个人微信 getmsg 抓包导入。历史列表请改用公众平台凭证。"""
+    """[已弃用] 旧 HAR 导入；请改用 Schinza accounts.json。"""
     console.print(
-        "[yellow]注意：微信改版后 profile_ext?action=getmsg 已不可靠。"
-        "请改用 python run.py import-platform-from-download-api "
-        "或 set-platform-creds。[/yellow]"
+        "[yellow]请优先用 Schinza 刷新凭证并运行 "
+        "python run.py import-schinza-credentials。旧 HAR 命令仅兼容保留。[/yellow]"
     )
     cfg = ctx.obj["cfg"]
     try:
@@ -405,7 +485,15 @@ def status_cmd(ctx: click.Context, as_json: bool = False) -> None:
         )
 
     platform = report["platform"]
-    if platform.get("backend") == "download_api":
+    if platform.get("backend") == "schinza_getmsg":
+        schinza = platform.get("schinza") or {}
+        console.print(
+            "Schinza: "
+            f"active={schinza.get('active', 0)} expired={schinza.get('expired', 0)} "
+            f"mapped={platform.get('mapped_accounts', 0)} "
+            f"need_session={platform.get('mapped_need_session', 0)}"
+        )
+    elif platform.get("backend") == "download_api":
         console.print(
             f"历史后端: download_api "
             f"({(cfg.get('platform') or {}).get('download_api_base_url')})"
@@ -644,7 +732,7 @@ def maintain_db_cmd(ctx: click.Context, event_retention_days: int) -> None:
 @click.option("--limit", default=None, type=int, help="限制账号数")
 @click.pass_context
 def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
-    """一键试点：导入 → 解析 →（若有平台凭证则拉历史）→ 抓正文。"""
+    """一键试点：导入 → 映射凭证 → 拉历史 → 抓正文。"""
     cfg = ctx.obj["cfg"]
     db = _db(cfg)
     client = HttpClient(cfg)
@@ -653,17 +741,23 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
     stats = import_name_list(db, cfg["paths"]["name_list"])
     console.print(stats)
 
-    console.print("[bold]2/4 解析 fakeid/__biz[/bold]")
-    with CrawlProgress(
-        title="解析账号",
-        log_path=_progress_log_path(cfg, "resolve"),
-        console=console,
-    ) as prog:
-        stats = resolve_pending_accounts(
-            db, client, cfg, limit=limit, progress=prog.callback
-        )
-    console.print(stats)
-    _seed_sample_articles(db)
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    if backend == "schinza_getmsg":
+        console.print("[bold]2/4 导入 Schinza 账号映射[/bold]")
+        stats = import_schinza_credentials(db, _schinza_accounts_path(cfg))
+        console.print({key: value for key, value in stats.items() if key != "details"})
+    else:
+        console.print("[bold]2/4 解析 fakeid/__biz[/bold]")
+        with CrawlProgress(
+            title="解析账号",
+            log_path=_progress_log_path(cfg, "resolve"),
+            console=console,
+        ) as prog:
+            stats = resolve_pending_accounts(
+                db, client, cfg, limit=limit, progress=prog.callback
+            )
+        console.print(stats)
+        _seed_sample_articles(db)
 
     platform_ok = False
     try:
@@ -673,7 +767,7 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
         platform_ok = False
 
     if platform_ok:
-        console.print("[bold]3/4 拉取历史列表[/bold]（公众平台）")
+        console.print(f"[bold]3/4 拉取历史列表[/bold]（{backend}）")
         with CrawlProgress(
             title="历史列表",
             log_path=_progress_log_path(cfg, "history"),
@@ -690,7 +784,7 @@ def pilot_cmd(ctx: click.Context, limit: int | None) -> None:
         console.print(stats)
     else:
         console.print(
-            "[bold]3/4 跳过历史列表[/bold]（尚未配置公众平台凭证；仅抓取样例正文）"
+            "[bold]3/4 跳过历史列表[/bold]（当前后端凭证不可用）"
         )
 
     console.print("[bold]4/4 抓取正文[/bold]")

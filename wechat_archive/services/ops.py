@@ -8,6 +8,7 @@ from typing import Any
 
 from wechat_archive.db import Database
 from wechat_archive.platform_client import load_platform_credentials
+from wechat_archive.schinza_client import summarize_schinza_accounts
 
 
 def classify_error(message: str | None) -> str:
@@ -128,7 +129,23 @@ def suggest_next_actions(db: Database, cfg: dict[str, Any] | None = None) -> lis
     rn = int(running["c"]) if running else 0
 
     creds = load_platform_credentials(cfg) if cfg else None
-    if cfg and not creds and (cfg.get("platform") or {}).get("backend") != "download_api":
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
+    if backend == "schinza_getmsg":
+        path = (cfg.get("platform") or {}).get("schinza_accounts_path")
+        try:
+            schinza = summarize_schinza_accounts(path) if path else None
+        except Exception:
+            schinza = None
+        if not schinza:
+            actions.append(
+                "找不到 Schinza 凭证 → 启动 Schinza 刷新后运行 "
+                "python run.py import-schinza-credentials"
+            )
+        elif not schinza["active"]:
+            actions.append(
+                "Schinza 没有有效凭证 → 在 Schinza 中刷新目标公众号后重新导入"
+            )
+    elif cfg and not creds and backend != "download_api":
         actions.append(
             "公众平台凭证未配置 → python run.py import-platform-from-download-api"
         )
@@ -136,9 +153,15 @@ def suggest_next_actions(db: Database, cfg: dict[str, Any] | None = None) -> lis
         actions.append("凭证已过期 → 重新扫码并 import-platform-from-download-api")
 
     if ns:
-        actions.append(
-            f"{ns} 个账号 need_session → 更新凭证后重跑 python run.py history"
-        )
+        if backend == "schinza_getmsg":
+            actions.append(
+                f"{ns} 个账号 need_session → 在 Schinza 中刷新后运行 "
+                "import-schinza-credentials，再重跑 history"
+            )
+        else:
+            actions.append(
+                f"{ns} 个账号 need_session → 更新凭证后重跑 python run.py history"
+            )
     if lr >= 3:
         wait_m = int((cfg.get("crawl") or {}).get("history_global_cooldown", 3600)) // 60
         actions.append(
@@ -150,9 +173,14 @@ def suggest_next_actions(db: Database, cfg: dict[str, Any] | None = None) -> lis
             f"{rn} 个账号仍为 running（可能中断）→ 下次 history 会自动回收；"
             "或先 python run.py doctor"
         )
-    if rp:
+    if rp and backend == "schinza_getmsg":
+        actions.append(
+            f"{rp} 个账号尚未匹配 Schinza → 刷新对应凭证并运行 "
+            "python run.py import-schinza-credentials"
+        )
+    elif rp:
         actions.append(f"{rp} 个账号待解析 → python run.py resolve")
-    if rf:
+    if rf and backend != "schinza_getmsg":
         actions.append(
             f"{rf} 个账号 resolve 失败 → python run.py retry-resolve 后再 resolve"
         )
@@ -197,12 +225,35 @@ def build_doctor_report(db: Database, cfg: dict[str, Any]) -> dict[str, Any]:
         """
     )
 
+    backend = (cfg.get("platform") or {}).get("backend", "platform")
     creds = load_platform_credentials(cfg)
     platform: dict[str, Any] = {
-        "backend": (cfg.get("platform") or {}).get("backend", "platform"),
+        "backend": backend,
         "configured": bool(creds)
-        or (cfg.get("platform") or {}).get("backend") == "download_api",
+        or backend == "download_api",
     }
+    if backend == "schinza_getmsg":
+        path = (cfg.get("platform") or {}).get("schinza_accounts_path")
+        try:
+            summary = summarize_schinza_accounts(path) if path else None
+        except Exception as exc:
+            summary = None
+            platform["error"] = str(exc)
+        platform["configured"] = bool(summary and summary["active"])
+        platform["schinza"] = summary
+        mapped = db.fetchone(
+            """
+            SELECT
+              COUNT(*) AS total,
+              SUM(CASE WHEN list_status='need_session' THEN 1 ELSE 0 END) AS need_session
+            FROM accounts
+            WHERE history_backend='schinza_getmsg' AND wechat_biz IS NOT NULL
+            """
+        )
+        platform["mapped_accounts"] = int(mapped["total"] or 0) if mapped else 0
+        platform["mapped_need_session"] = (
+            int(mapped["need_session"] or 0) if mapped else 0
+        )
     if creds:
         platform["source"] = creds.source
         platform["nickname"] = creds.nickname
